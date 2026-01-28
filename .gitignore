@@ -1,0 +1,40 @@
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Kernel module build artifacts
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+modules.order
+Module.symvers
+built-in.a
+
+# Editor and IDE
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.py
+
+# BPFtrace
+*.bt
+
+# Analysis
+r8169_main_rtl8168h_analysis.c
+
+# Private / Reference
+references/
+
+# Others
+core
+*.txt
