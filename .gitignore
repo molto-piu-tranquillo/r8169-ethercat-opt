@@ -35,6 +35,8 @@ r8169_main_rtl8168h_analysis.c
 # Private / Reference
 references/
 
+
 # Others
 core
 *.txt
+session-context/
