@@ -18,30 +18,14 @@ SOEM EtherCAT 마스터의 send-recv 레이턴시를 31μs 이하로 줄이기 �
 | `r8169_ethercat_opt/`     | EtherCAT 특화 최적화                                              |
 | `r8169_custom/`           | 기타 커스텀 실험                                                  |
 
-루트의 `r8169_*.c` 파일들은 커널 6.8 원본 소스입니다.
-
-## r8169_latest 정보
-
-최신 메인라인 커널(6.12+)의 r8169 드라이버를 커널 6.8에서 빌드 가능하도록 포팅한 버전입니다.
-
-**포함된 개선사항:**
-
-- 새 칩셋 지원: RTL8125D, RTL8126A, RTL8127A 등
-- RTL8168H ASPM 개선
-- RTL8125B 온도 센서(hwmon) 지원
-- 각종 버그 수정
-
-**RTL8168H EEE 기능 복원:**
-
-- TX LPI 타이머 설정 (`rtl_set_eee_txidle_timer`)
-- TX LPI 활성화 (`rtl_enable_tx_lpi`)
+루트의 `r8169_*.c` 파일들은 커널 원본 소스입니다.
 
 ## 빌드 및 설치
 
 각 폴더에서 개별적으로 빌드합니다:
 
 ```bash
-cd r8169_optimized  # 또는 r8169_latest
+cd r8169_optimized  # 또는 r8169_*
 make              # 빌드
 sudo make install # 기존 드라이버 제거 후 최적화 드라이버 로드
 sudo make uninstall # 최적화 드라이버 제거 후 원본 드라이버 복원
