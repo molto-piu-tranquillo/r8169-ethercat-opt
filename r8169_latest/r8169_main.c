@@ -721,6 +721,7 @@ struct rtl8169_private {
 	struct page *Rx_databuff[NUM_RX_DESC]; /* Rx data buffers */
 	struct ring_info tx_skb[NUM_TX_DESC]; /* Tx data buffers */
 	u16 cp_cmd;
+	u16 tx_lpi_timer; /* EEE TX idle timer value */
 	u32 irq_mask;
 	int irq;
 	struct clk *clk;
@@ -2150,7 +2151,31 @@ static int rtl_set_coalesce(struct net_device *dev, struct ethtool_coalesce *ec,
 	return 0;
 }
 
-/* tx_lpi_timer functions removed for kernel 6.8 compatibility */
+static void rtl_set_eee_txidle_timer(struct rtl8169_private *tp)
+{
+	unsigned int timer_val = READ_ONCE(tp->dev->mtu) + ETH_HLEN + 0x20;
+
+	switch (tp->mac_version) {
+	case RTL_GIGA_MAC_VER_46:
+	case RTL_GIGA_MAC_VER_48:
+		tp->tx_lpi_timer = timer_val;
+		r8168_mac_ocp_write(tp, 0xe048, timer_val);
+		break;
+	case RTL_GIGA_MAC_VER_61 ... RTL_GIGA_MAC_VER_LAST:
+		tp->tx_lpi_timer = timer_val;
+		RTL_W16(tp, EEE_TXIDLE_TIMER_8125, timer_val);
+		break;
+	default:
+		break;
+	}
+}
+
+static u32 r8169_get_tx_lpi_timer_us(struct rtl8169_private *tp)
+{
+	u16 timer = tp->tx_lpi_timer;
+
+	return timer * 64 / 1000; /* 64ns units to us */
+}
 
 static int rtl8169_get_eee(struct net_device *dev, struct ethtool_eee *data)
 {
@@ -3936,7 +3961,7 @@ static void rtl_hw_start(struct rtl8169_private *tp)
 	rtl_hw_aspm_clkreq_enable(tp, false);
 	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
 
-	/* rtl_set_eee_txidle_timer removed for 6.8 compat */
+	rtl_set_eee_txidle_timer(tp);
 
 	if (tp->mac_version <= RTL_GIGA_MAC_VER_06)
 		rtl_hw_start_8169(tp);
@@ -3971,7 +3996,7 @@ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
 	WRITE_ONCE(dev->mtu, new_mtu);
 	netdev_update_features(dev);
 	rtl_jumbo_config(tp);
-	/* rtl_set_eee_txidle_timer removed for 6.8 compat */
+	rtl_set_eee_txidle_timer(tp);
 
 	return 0;
 }
@@ -4807,6 +4832,9 @@ static void r8169_phylink_handler(struct net_device *ndev)
 
 	if (netif_carrier_ok(ndev)) {
 		rtl_link_chg_patch(tp);
+		/* Enable TX LPI mode for RTL8168H when EEE is supported */
+		if (rtl_supports_eee(tp))
+			rtl_enable_tx_lpi(tp, true);
 		pm_request_resume(d);
 		netif_wake_queue(tp->dev);
 	} else {
