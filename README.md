@@ -26,8 +26,8 @@ SOEM EtherCAT 마스터의 send-recv 레이턴시를 31μs 이하로 줄이기 �
 
 ```bash
 cd r8169_optimized  # 또는 r8169_*
-make              # 빌드
-sudo make install # 기존 드라이버 제거 후 최적화 드라이버 로드
+make                # 빌드
+sudo make install   # 기존 드라이버 제거 후 최적화 드라이버 로드
 sudo make uninstall # 최적화 드라이버 제거 후 원본 드라이버 복원
 ```
 
