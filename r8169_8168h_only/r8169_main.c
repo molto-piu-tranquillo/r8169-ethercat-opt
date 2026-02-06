@@ -1081,66 +1081,13 @@ static int rtl8169_get_regs_len(struct net_device *dev)
 	return R8169_REGS_SIZE;
 }
 
-static netdev_features_t rtl8169_fix_features(struct net_device *dev,
-	netdev_features_t features)
-{
-	if (dev->mtu > TD_MSS_MAX)
-		features &= ~NETIF_F_ALL_TSO;
-
-	if (dev->mtu > ETH_DATA_LEN)
-		features &= ~(NETIF_F_CSUM_MASK | NETIF_F_ALL_TSO);
-
-	return features;
-}
-
-static void rtl_set_rx_config_features(struct rtl8169_private *tp,
-				       netdev_features_t features)
+static void rtl_set_rx_config_defaults(struct rtl8169_private *tp)
 {
 	u32 rx_config = RTL_R32(tp, RxConfig);
 
-	if (features & NETIF_F_RXALL)
-		rx_config |= RX_CONFIG_ACCEPT_ERR_MASK;
-	else
-		rx_config &= ~RX_CONFIG_ACCEPT_ERR_MASK;
+	rx_config &= ~RX_CONFIG_ACCEPT_ERR_MASK;
 
 	RTL_W32(tp, RxConfig, rx_config);
-}
-
-static int rtl8169_set_features(struct net_device *dev,
-				netdev_features_t features)
-{
-	struct rtl8169_private *tp = netdev_priv(dev);
-
-	rtl_set_rx_config_features(tp, features);
-
-	if (features & NETIF_F_RXCSUM)
-		tp->cp_cmd |= RxChkSum;
-	else
-		tp->cp_cmd &= ~RxChkSum;
-
-	if (features & NETIF_F_HW_VLAN_CTAG_RX)
-		tp->cp_cmd |= RxVlan;
-	else
-		tp->cp_cmd &= ~RxVlan;
-
-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
-	rtl_pci_commit(tp);
-
-	return 0;
-}
-
-static inline u32 rtl8169_tx_vlan_tag(struct sk_buff *skb)
-{
-	return (skb_vlan_tag_present(skb)) ?
-		TxVlanTag | swab16(skb_vlan_tag_get(skb)) : 0x00;
-}
-
-static void rtl8169_rx_vlan_tag(struct RxDesc *desc, struct sk_buff *skb)
-{
-	u32 opts2 = le32_to_cpu(desc->opts2);
-
-	if (opts2 & RxVlanTag)
-		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), swab16(opts2 & 0xffff));
 }
 
 static void rtl8169_get_regs(struct net_device *dev, struct ethtool_regs *regs,
@@ -2034,7 +1981,7 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
 	RTL_W8(tp, ChipCmd, CmdTxEnb | CmdRxEnb);
 	rtl_init_rxcfg(tp);
 	rtl_set_tx_config_registers(tp);
-	rtl_set_rx_config_features(tp, tp->dev->features);
+	rtl_set_rx_config_defaults(tp);
 	rtl_set_rx_mode(tp->dev);
 	rtl_irq_enable(tp);
 }
@@ -2044,7 +1991,6 @@ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
 	struct rtl8169_private *tp = netdev_priv(dev);
 
 	dev->mtu = new_mtu;
-	netdev_update_features(dev);
 	rtl_jumbo_config(tp);
 
 	return 0;
@@ -2244,111 +2190,34 @@ static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
 	return 0;
 }
 
-static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
-			      const u32 *opts, unsigned int entry)
+static bool rtl8169_hw_csum(struct sk_buff *skb, u32 *opts)
 {
-	struct skb_shared_info *info = skb_shinfo(skb);
-	unsigned int cur_frag;
+	u8 ip_protocol;
 
-	for (cur_frag = 0; cur_frag < info->nr_frags; cur_frag++) {
-		const skb_frag_t *frag = info->frags + cur_frag;
-		void *addr = skb_frag_address(frag);
-		u32 len = skb_frag_size(frag);
+	if (skb->ip_summed != CHECKSUM_PARTIAL)
+		return true;
 
-		entry = (entry + 1) % NUM_TX_DESC;
-
-		if (unlikely(rtl8169_tx_map(tp, opts, len, addr, entry, true)))
-			goto err_out;
+	switch (vlan_get_protocol(skb)) {
+	case htons(ETH_P_IP):
+		opts[1] |= TD1_IPv4_CS;
+		ip_protocol = ip_hdr(skb)->protocol;
+		break;
+	case htons(ETH_P_IPV6):
+		opts[1] |= TD1_IPv6_CS;
+		ip_protocol = ipv6_hdr(skb)->nexthdr;
+		break;
+	default:
+		return !skb_checksum_help(skb);
 	}
 
-	return 0;
+	if (ip_protocol == IPPROTO_TCP)
+		opts[1] |= TD1_TCP_CS;
+	else if (ip_protocol == IPPROTO_UDP)
+		opts[1] |= TD1_UDP_CS;
+	else
+		return !skb_checksum_help(skb);
 
-err_out:
-	rtl8169_tx_clear_range(tp, tp->cur_tx + 1, cur_frag);
-	return -EIO;
-}
-
-static unsigned int rtl_quirk_packet_padto(struct rtl8169_private *tp,
-					   struct sk_buff *skb)
-{
-	(void)tp;
-	(void)skb;
-	return 0;
-}
-
-static void rtl8169_tso_csum_v1(struct sk_buff *skb, u32 *opts)
-{
-	u32 mss = skb_shinfo(skb)->gso_size;
-
-	if (mss) {
-		opts[0] |= TD_LSO;
-		opts[0] |= mss << TD0_MSS_SHIFT;
-	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		const struct iphdr *ip = ip_hdr(skb);
-
-		if (ip->protocol == IPPROTO_TCP)
-			opts[0] |= TD0_IP_CS | TD0_TCP_CS;
-		else if (ip->protocol == IPPROTO_UDP)
-			opts[0] |= TD0_IP_CS | TD0_UDP_CS;
-		else
-			WARN_ON_ONCE(1);
-	}
-}
-
-static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
-				struct sk_buff *skb, u32 *opts)
-{
-	struct skb_shared_info *shinfo = skb_shinfo(skb);
-	u32 mss = shinfo->gso_size;
-
-	if (mss) {
-		if (shinfo->gso_type & SKB_GSO_TCPV4) {
-			opts[0] |= TD1_GTSENV4;
-		} else if (shinfo->gso_type & SKB_GSO_TCPV6) {
-			if (skb_cow_head(skb, 0))
-				return false;
-
-			tcp_v6_gso_csum_prep(skb);
-			opts[0] |= TD1_GTSENV6;
-		} else {
-			WARN_ON_ONCE(1);
-		}
-
-		opts[0] |= skb_transport_offset(skb) << GTTCPHO_SHIFT;
-		opts[1] |= mss << TD1_MSS_SHIFT;
-	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		u8 ip_protocol;
-
-		switch (vlan_get_protocol(skb)) {
-		case htons(ETH_P_IP):
-			opts[1] |= TD1_IPv4_CS;
-			ip_protocol = ip_hdr(skb)->protocol;
-			break;
-
-		case htons(ETH_P_IPV6):
-			opts[1] |= TD1_IPv6_CS;
-			ip_protocol = ipv6_hdr(skb)->nexthdr;
-			break;
-
-		default:
-			ip_protocol = IPPROTO_RAW;
-			break;
-		}
-
-		if (ip_protocol == IPPROTO_TCP)
-			opts[1] |= TD1_TCP_CS;
-		else if (ip_protocol == IPPROTO_UDP)
-			opts[1] |= TD1_UDP_CS;
-		else
-			WARN_ON_ONCE(1);
-
-		opts[1] |= skb_transport_offset(skb) << TCPHO_SHIFT;
-	} else {
-		unsigned int padto = rtl_quirk_packet_padto(tp, skb);
-
-		/* skb_padto would free the skb on error */
-		return !__skb_put_padto(skb, padto, false);
-	}
+	opts[1] |= skb_transport_offset(skb) << TCPHO_SHIFT;
 
 	return true;
 }
@@ -2356,12 +2225,6 @@ static bool rtl8169_tso_csum_v2(struct rtl8169_private *tp,
 static unsigned int rtl_tx_slots_avail(struct rtl8169_private *tp)
 {
 	return READ_ONCE(tp->dirty_tx) + NUM_TX_DESC - READ_ONCE(tp->cur_tx);
-}
-
-static bool rtl_chip_supports_csum_v2(struct rtl8169_private *tp)
-{
-	(void)tp;
-	return true;
 }
 
 static void rtl8169_doorbell(struct rtl8169_private *tp)
@@ -2372,10 +2235,9 @@ static void rtl8169_doorbell(struct rtl8169_private *tp)
 static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 				      struct net_device *dev)
 {
-	unsigned int frags = skb_shinfo(skb)->nr_frags;
 	struct rtl8169_private *tp = netdev_priv(dev);
 	unsigned int entry = tp->cur_tx % NUM_TX_DESC;
-	struct TxDesc *txd_first, *txd_last;
+	struct TxDesc *txd_first;
 	bool stop_queue, door_bell;
 	u32 opts[2];
 
@@ -2385,12 +2247,13 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 		goto err_stop_0;
 	}
 
-	opts[1] = rtl8169_tx_vlan_tag(skb);
+	if (unlikely(skb_is_nonlinear(skb) && skb_linearize(skb)))
+		goto err_dma_0;
+
+	opts[1] = 0;
 	opts[0] = 0;
 
-	if (!rtl_chip_supports_csum_v2(tp))
-		rtl8169_tso_csum_v1(skb, opts);
-	else if (!rtl8169_tso_csum_v2(tp, skb, opts))
+	if (!rtl8169_hw_csum(skb, opts))
 		goto err_dma_0;
 
 	if (unlikely(rtl8169_tx_map(tp, opts, skb_headlen(skb), skb->data,
@@ -2398,15 +2261,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 		goto err_dma_0;
 
 	txd_first = tp->TxDescArray + entry;
-
-	if (frags) {
-		if (rtl8169_xmit_frags(tp, skb, opts, entry))
-			goto err_dma_1;
-		entry = (entry + frags) % NUM_TX_DESC;
-	}
-
-	txd_last = tp->TxDescArray + entry;
-	txd_last->opts1 |= cpu_to_le32(LastFrag);
+	txd_first->opts1 |= cpu_to_le32(LastFrag);
 	tp->tx_skb[entry].skb = skb;
 
 	skb_tx_timestamp(skb);
@@ -2421,7 +2276,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 	/* rtl_tx needs to see descriptor changes before updated tp->cur_tx */
 	smp_wmb();
 
-	WRITE_ONCE(tp->cur_tx, tp->cur_tx + frags + 1);
+	WRITE_ONCE(tp->cur_tx, tp->cur_tx + 1);
 
 	stop_queue = !netif_subqueue_maybe_stop(dev, 0, rtl_tx_slots_avail(tp),
 						R8169_TX_STOP_THRS,
@@ -2430,9 +2285,6 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 		rtl8169_doorbell(tp);
 
 	return NETDEV_TX_OK;
-
-err_dma_1:
-	rtl8169_unmap_tx_skb(tp, entry);
 err_dma_0:
 	dev_kfree_skb_any(skb);
 	dev->stats.tx_dropped++;
@@ -2448,26 +2300,18 @@ static netdev_features_t rtl8169_features_check(struct sk_buff *skb,
 						struct net_device *dev,
 						netdev_features_t features)
 {
-	struct rtl8169_private *tp = netdev_priv(dev);
+	(void)dev;
 
-	if (skb_is_gso(skb)) {
-		if (skb_transport_offset(skb) > GTTCPHO_MAX &&
-		    rtl_chip_supports_csum_v2(tp))
-			features &= ~NETIF_F_ALL_TSO;
-	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 		/* work around hw bug on some chip versions */
 		if (skb->len < ETH_ZLEN)
 			features &= ~NETIF_F_CSUM_MASK;
 
-		if (rtl_quirk_packet_padto(tp, skb))
-			features &= ~NETIF_F_CSUM_MASK;
-
-		if (skb_transport_offset(skb) > TCPHO_MAX &&
-		    rtl_chip_supports_csum_v2(tp))
+		if (skb_transport_offset(skb) > TCPHO_MAX)
 			features &= ~NETIF_F_CSUM_MASK;
 	}
 
-	return vlan_features_check(skb, features);
+	return features;
 }
 
 static void rtl8169_pcierr_interrupt(struct net_device *dev)
@@ -2582,16 +2426,11 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 				dev->stats.rx_length_errors++;
 			if (status & RxCRC)
 				dev->stats.rx_crc_errors++;
-
-			if (!(dev->features & NETIF_F_RXALL))
-				goto release_descriptor;
-			else if (status & RxRWT || !(status & (RxRUNT | RxCRC)))
-				goto release_descriptor;
+			goto release_descriptor;
 		}
 
 		pkt_size = status & GENMASK(13, 0);
-		if (likely(!(dev->features & NETIF_F_RXFCS)))
-			pkt_size -= ETH_FCS_LEN;
+		pkt_size -= ETH_FCS_LEN;
 
 		/* The driver does not support incoming fragmented frames.
 		 * They are seen as a symptom of over-mtu sized frames.
@@ -2620,8 +2459,6 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 
 		rtl8169_rx_csum(skb, status);
 		skb->protocol = eth_type_trans(skb, dev);
-
-		rtl8169_rx_vlan_tag(desc, skb);
 
 		if (skb->pkt_type == PACKET_MULTICAST)
 			dev->stats.multicast++;
@@ -3037,8 +2874,6 @@ static const struct net_device_ops rtl_netdev_ops = {
 	.ndo_tx_timeout		= rtl8169_tx_timeout,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= rtl8169_change_mtu,
-	.ndo_fix_features	= rtl8169_fix_features,
-	.ndo_set_features	= rtl8169_set_features,
 	.ndo_set_mac_address	= rtl_set_mac_address,
 	.ndo_eth_ioctl		= phy_do_ioctl_running,
 	.ndo_set_rx_mode	= rtl_set_rx_mode,
@@ -3287,6 +3122,8 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	tp->aspm_manageable = !rc;
 
 	tp->cp_cmd = RTL_R16(tp, CPlusCmd) & CPCMD_MASK;
+	tp->cp_cmd |= RxChkSum;
+	tp->cp_cmd &= ~RxVlan;
 
 	if (sizeof(dma_addr_t) > 4 &&
 	    !dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64)))
@@ -3314,31 +3151,13 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	netif_napi_add(dev, &tp->napi, rtl8169_poll);
 
-	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
-			   NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
-	dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO;
+	dev->hw_features = 0;
+	dev->vlan_features = 0;
 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 
-	dev->hw_features |= NETIF_F_IPV6_CSUM;
-
-	dev->features |= dev->hw_features;
-
-	/* There has been a number of reports that using SG/TSO results in
-	 * tx timeouts. However for a lot of people SG/TSO works fine.
-	 * Therefore disable both features by default, but allow users to
-	 * enable them. Use at own risk!
-	 */
-	dev->hw_features |= NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
-	netif_set_tso_max_size(dev, RTL_GSO_MAX_SIZE_V2);
-	netif_set_tso_max_segs(dev, RTL_GSO_MAX_SEGS_V2);
-
-	dev->hw_features |= NETIF_F_RXALL;
-	dev->hw_features |= NETIF_F_RXFCS;
+	dev->features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM;
 
 	netdev_sw_irq_coalesce_default_on(dev);
-
-	/* configure chip for default features */
-	rtl8169_set_features(dev, dev->features);
 
 	rtl_set_d3_pll_down(tp, true);
 
