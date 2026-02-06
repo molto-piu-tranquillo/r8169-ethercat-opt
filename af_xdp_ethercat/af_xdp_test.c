@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * AF_XDP EtherCAT Test Utility
+ * AF_XDP EtherCAT Test Utility (libbpf-only version)
  * 
  * Tests AF_XDP zero-copy performance with r8169_xdp driver.
  * Measures latency for EtherCAT-like packet processing.
@@ -23,11 +23,11 @@
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
+#include <linux/if_xdp.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-#include <xdp/xsk.h>
-#include <xdp/libxdp.h>
+#include <bpf/xsk.h>
 
 #define NUM_FRAMES 4096
 #define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
@@ -53,10 +53,10 @@ struct xsk_socket_info {
 };
 
 static volatile int running = 1;
-static struct xdp_program *xdp_prog = NULL;
 
 static void signal_handler(int sig)
 {
+	(void)sig;
 	running = 0;
 }
 
@@ -83,19 +83,25 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname,
 
 	/* Allocate UMEM */
 	umem_area = mmap(NULL, NUM_FRAMES * FRAME_SIZE, PROT_READ | PROT_WRITE,
-			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
 	if (umem_area == MAP_FAILED) {
-		fprintf(stderr, "Failed to allocate UMEM: %s\n",
-			strerror(errno));
-		free(xsk_info);
-		return NULL;
+		/* Fall back to regular pages if huge pages not available */
+		umem_area = mmap(NULL, NUM_FRAMES * FRAME_SIZE,
+				 PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (umem_area == MAP_FAILED) {
+			fprintf(stderr, "Failed to allocate UMEM: %s\n",
+				strerror(errno));
+			free(xsk_info);
+			return NULL;
+		}
 	}
 	xsk_info->umem_area = umem_area;
 
 	/* Configure UMEM */
 	memset(&umem_cfg, 0, sizeof(umem_cfg));
-	umem_cfg.fill_size = NUM_FRAMES;
-	umem_cfg.comp_size = NUM_FRAMES;
+	umem_cfg.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	umem_cfg.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	umem_cfg.frame_size = FRAME_SIZE;
 	umem_cfg.frame_headroom = FRAME_HEADROOM;
 	umem_cfg.flags = 0;
@@ -112,8 +118,9 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname,
 
 	/* Configure socket */
 	memset(&xsk_cfg, 0, sizeof(xsk_cfg));
-	xsk_cfg.rx_size = NUM_FRAMES;
-	xsk_cfg.tx_size = NUM_FRAMES;
+	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+	xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
 	xsk_cfg.bind_flags = XDP_COPY; /* Start with copy mode for testing */
 	xsk_cfg.xdp_flags = 0;
 
@@ -130,9 +137,11 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname,
 	}
 
 	/* Populate fill queue */
-	ret = xsk_ring_prod__reserve(&xsk_info->fq, NUM_FRAMES / 2, &idx);
-	if (ret != NUM_FRAMES / 2) {
-		fprintf(stderr, "Failed to populate FQ\n");
+	ret = xsk_ring_prod__reserve(&xsk_info->fq,
+				     XSK_RING_PROD__DEFAULT_NUM_DESCS, &idx);
+	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS) {
+		fprintf(stderr, "Failed to populate FQ (got %d, expected %d)\n",
+			ret, XSK_RING_PROD__DEFAULT_NUM_DESCS);
 		xsk_socket__delete(xsk_info->xsk);
 		xsk_umem__delete(xsk_info->umem);
 		munmap(umem_area, NUM_FRAMES * FRAME_SIZE);
@@ -140,10 +149,10 @@ static struct xsk_socket_info *xsk_configure_socket(const char *ifname,
 		return NULL;
 	}
 
-	for (__u32 i = 0; i < NUM_FRAMES / 2; i++)
+	for (__u32 i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i++)
 		*xsk_ring_prod__fill_addr(&xsk_info->fq, idx + i) =
 			i * FRAME_SIZE;
-	xsk_ring_prod__submit(&xsk_info->fq, NUM_FRAMES / 2);
+	xsk_ring_prod__submit(&xsk_info->fq, XSK_RING_PROD__DEFAULT_NUM_DESCS);
 
 	xsk_info->rx_timestamp_min = ~0ULL;
 
@@ -163,7 +172,7 @@ static void xsk_cleanup(struct xsk_socket_info *xsk_info)
 
 static void process_packets(struct xsk_socket_info *xsk_info)
 {
-	__u32 idx_rx = 0;
+	__u32 idx_rx = 0, idx_fq = 0;
 	__u32 rcvd;
 	__u64 start_time = gettime_ns();
 
@@ -178,9 +187,8 @@ static void process_packets(struct xsk_socket_info *xsk_info)
 		__u32 len = desc->len;
 		struct ethhdr *eth = pkt;
 
-		/* Process EtherCAT packet */
-		if (len >= sizeof(struct ethhdr) &&
-		    eth->h_proto == htons(ETH_P_ETHERCAT)) {
+		/* Process any packet (or filter EtherCAT) */
+		if (len >= sizeof(struct ethhdr)) {
 			__u64 latency = gettime_ns() - start_time;
 
 			xsk_info->rx_packets++;
@@ -192,15 +200,18 @@ static void process_packets(struct xsk_socket_info *xsk_info)
 				xsk_info->rx_timestamp_min = latency;
 			if (latency > xsk_info->rx_timestamp_max)
 				xsk_info->rx_timestamp_max = latency;
+
+			/* Check if EtherCAT */
+			if (ntohs(eth->h_proto) == ETH_P_ETHERCAT) {
+				/* EtherCAT packet received */
+			}
 		}
 	}
 
 	xsk_ring_cons__release(&xsk_info->rx, rcvd);
 
 	/* Refill FQ */
-	__u32 idx_fq;
-	int ret = xsk_ring_prod__reserve(&xsk_info->fq, rcvd, &idx_fq);
-	if (ret == (int)rcvd) {
+	if (xsk_ring_prod__reserve(&xsk_info->fq, rcvd, &idx_fq) == rcvd) {
 		for (__u32 i = 0; i < rcvd; i++) {
 			const struct xdp_desc *desc = xsk_ring_cons__rx_desc(
 				&xsk_info->rx, idx_rx + i);
@@ -217,9 +228,12 @@ static void print_stats(struct xsk_socket_info *xsk_info, double elapsed_sec)
 	printf("Duration: %.2f seconds\n", elapsed_sec);
 	printf("RX Packets: %llu\n", (unsigned long long)xsk_info->rx_packets);
 	printf("RX Bytes: %llu\n", (unsigned long long)xsk_info->rx_bytes);
-	printf("RX Rate: %.2f pps\n", xsk_info->rx_packets / elapsed_sec);
+	printf("RX Rate: %.2f pps\n",
+	       elapsed_sec > 0 ? xsk_info->rx_packets / elapsed_sec : 0);
 	printf("Throughput: %.2f Mbps\n",
-	       (xsk_info->rx_bytes * 8.0) / (elapsed_sec * 1000000));
+	       elapsed_sec > 0 ?
+		       (xsk_info->rx_bytes * 8.0) / (elapsed_sec * 1000000) :
+		       0);
 
 	if (xsk_info->rx_count > 0) {
 		printf("\n=== Latency Statistics ===\n");
@@ -233,6 +247,8 @@ static void print_stats(struct xsk_socket_info *xsk_info, double elapsed_sec)
 		       (double)xsk_info->rx_timestamp_sum / xsk_info->rx_count,
 		       (double)xsk_info->rx_timestamp_sum / xsk_info->rx_count /
 			       1000.0);
+	} else {
+		printf("\nNo packets received.\n");
 	}
 }
 
@@ -296,13 +312,13 @@ int main(int argc, char **argv)
 	}
 
 	printf("XSK socket created successfully\n");
-	printf("Waiting for EtherCAT packets...\n");
+	printf("Waiting for packets...\n");
 
 	fds[0].fd = xsk_socket__fd(xsk_info->xsk);
 	fds[0].events = POLLIN;
 
 	start_time = gettime_ns();
-	end_time = start_time + duration * 1000000000ULL;
+	end_time = start_time + (__u64)duration * 1000000000ULL;
 
 	while (running && gettime_ns() < end_time) {
 		int ret = poll(fds, 1, 100);

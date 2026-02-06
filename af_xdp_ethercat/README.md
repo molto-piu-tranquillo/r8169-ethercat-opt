@@ -5,7 +5,7 @@ Low-latency EtherCAT communication testing with AF_XDP zero-copy.
 ## Prerequisites
 
 ```bash
-sudo apt install libbpf-dev libxdp-dev clang llvm libelf-dev
+sudo apt install libbpf-dev libelf-dev clang
 ```
 
 ## Build
@@ -19,41 +19,53 @@ make
 ### 1. Load the r8169_xdp driver
 
 ```bash
-# Unload original driver
-sudo rmmod r8169
-
-# Load XDP-enabled driver
-sudo insmod ../r8169_xdp/r8169_xdp.ko
+cd ../r8169_xdp
+make install
 ```
 
-### 2. Load XDP program (optional)
+### 2. Run test
 
 ```bash
-sudo ip link set dev <interface> xdpgeneric obj xdp_ethercat.bpf.o sec xdp
+# Basic test (10 seconds)
+sudo ./af_xdp_test -i eth0 -t 10
+
+# With RT priority (recommended)
+sudo chrt -f 99 taskset -c 3 ./af_xdp_test -i eth0 -t 60
 ```
 
-### 3. Run test
+### 3. Options
 
-```bash
-sudo ./af_xdp_test -i <interface> -t 10
+| Option | Description        | Default    |
+| ------ | ------------------ | ---------- |
+| `-i`   | Network interface  | (required) |
+| `-q`   | Queue ID           | 0          |
+| `-t`   | Duration (seconds) | 10         |
+
+## Output Example
+
 ```
+=== AF_XDP Test Results ===
+Duration: 10.00 seconds
+RX Packets: 10000
+RX Rate: 1000.00 pps
 
-### 4. Cleanup
-
-```bash
-sudo ip link set dev <interface> xdpgeneric off
+=== Latency Statistics ===
+Min: 2500 ns (2.50 us)
+Max: 15000 ns (15.00 us)
+Avg: 5000.00 ns (5.00 us)
 ```
 
 ## Files
 
-- `xdp_ethercat.bpf.c` - XDP BPF program for EtherCAT filtering
-- `af_xdp_test.c` - AF_XDP latency test utility
-- `Makefile` - Build system
+| File                 | Description                 |
+| -------------------- | --------------------------- |
+| `af_xdp_test.c`      | AF_XDP latency test utility |
+| `xdp_ethercat.bpf.c` | XDP BPF filter (optional)   |
+| `Makefile`           | Build system                |
 
-## Expected Results
+## Cleanup
 
-With r8169_xdp driver:
-
-- RX latency: ~5-10 µs (vs ~30-50 µs with SOEM)
-- Zero-copy buffer handling
-- PREEMPT_RT safe
+```bash
+cd ../r8169_xdp
+make uninstall
+```
