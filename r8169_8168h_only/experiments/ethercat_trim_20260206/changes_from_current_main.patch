@@ -1,0 +1,1203 @@
+diff --git a/r8169_8168h_only/Makefile b/r8169_8168h_only/Makefile
+index db14b70..6ff8d21 100644
+--- a/r8169_8168h_only/Makefile
++++ b/r8169_8168h_only/Makefile
+@@ -8,7 +8,7 @@ KDIR ?= /lib/modules/$(KVER)/build
+ 
+ # Module name
+ obj-m := r8169_8168h_only.o
+-r8169_8168h_only-y := r8169_main.o r8169_firmware.o r8169_phy_config.o r8169_leds.o
++r8169_8168h_only-y := r8169_main.o r8169_firmware.o r8169_phy_config.o
+ 
+ # Build
+ all:
+diff --git a/r8169_8168h_only/r8169.h b/r8169_8168h_only/r8169.h
+index c541bb8..99c963c 100644
+--- a/r8169_8168h_only/r8169.h
++++ b/r8169_8168h_only/r8169.h
+@@ -8,7 +8,6 @@
+  * See MAINTAINERS file for support contact information.
+  */
+ 
+-#include <linux/netdevice.h>
+ #include <linux/types.h>
+ #include <linux/phy.h>
+ 
+@@ -18,9 +17,3 @@ void r8169_apply_firmware(struct rtl8169_private *tp);
+ u16 rtl8168h_2_get_adc_bias_ioffset(struct rtl8169_private *tp);
+ u8 rtl8168d_efuse_read(struct rtl8169_private *tp, int reg_addr);
+ void r8169_hw_phy_config(struct rtl8169_private *tp, struct phy_device *phydev);
+-
+-void r8169_get_led_name(struct rtl8169_private *tp, int idx,
+-			char *buf, int buf_len);
+-int rtl8168_get_led_mode(struct rtl8169_private *tp);
+-int rtl8168_led_mod_ctrl(struct rtl8169_private *tp, u16 mask, u16 val);
+-void rtl8168_init_leds(struct net_device *ndev);
+diff --git a/r8169_8168h_only/r8169_leds.c b/r8169_8168h_only/r8169_leds.c
+deleted file mode 100644
+index 007d077..0000000
+--- a/r8169_8168h_only/r8169_leds.c
++++ /dev/null
+@@ -1,157 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/* r8169_leds.c: Realtek 8169/8168/8101/8125 ethernet driver.
+- *
+- * Copyright (c) 2023 Heiner Kallweit <hkallweit1@gmail.com>
+- *
+- * See MAINTAINERS file for support contact information.
+- */
+-
+-#include <linux/leds.h>
+-#include <linux/netdevice.h>
+-#include <uapi/linux/uleds.h>
+-
+-#include "r8169.h"
+-
+-#define RTL8168_LED_CTRL_OPTION2	BIT(15)
+-#define RTL8168_LED_CTRL_ACT		BIT(3)
+-#define RTL8168_LED_CTRL_LINK_1000	BIT(2)
+-#define RTL8168_LED_CTRL_LINK_100	BIT(1)
+-#define RTL8168_LED_CTRL_LINK_10	BIT(0)
+-
+-#define RTL8168_NUM_LEDS		3
+-
+-#define RTL8168_SUPPORTED_MODES \
+-	(BIT(TRIGGER_NETDEV_LINK_1000) | BIT(TRIGGER_NETDEV_LINK_100) | \
+-	 BIT(TRIGGER_NETDEV_LINK_10) | BIT(TRIGGER_NETDEV_RX) | \
+-	 BIT(TRIGGER_NETDEV_TX))
+-
+-struct r8169_led_classdev {
+-	struct led_classdev led;
+-	struct net_device *ndev;
+-	int index;
+-};
+-
+-#define lcdev_to_r8169_ldev(lcdev) container_of(lcdev, struct r8169_led_classdev, led)
+-
+-static int rtl8168_led_hw_control_is_supported(struct led_classdev *led_cdev,
+-					       unsigned long flags)
+-{
+-	struct r8169_led_classdev *ldev = lcdev_to_r8169_ldev(led_cdev);
+-	struct rtl8169_private *tp = netdev_priv(ldev->ndev);
+-	int shift = ldev->index * 4;
+-	bool rx, tx;
+-
+-	if (flags & ~RTL8168_SUPPORTED_MODES)
+-		goto nosupp;
+-
+-	rx = flags & BIT(TRIGGER_NETDEV_RX);
+-	tx = flags & BIT(TRIGGER_NETDEV_TX);
+-	if (rx != tx)
+-		goto nosupp;
+-
+-	return 0;
+-
+-nosupp:
+-	/* Switch LED off to indicate that mode isn't supported */
+-	rtl8168_led_mod_ctrl(tp, 0x000f << shift, 0);
+-	return -EOPNOTSUPP;
+-}
+-
+-static int rtl8168_led_hw_control_set(struct led_classdev *led_cdev,
+-				      unsigned long flags)
+-{
+-	struct r8169_led_classdev *ldev = lcdev_to_r8169_ldev(led_cdev);
+-	struct rtl8169_private *tp = netdev_priv(ldev->ndev);
+-	int shift = ldev->index * 4;
+-	u16 mode = 0;
+-
+-	if (flags & BIT(TRIGGER_NETDEV_LINK_10))
+-		mode |= RTL8168_LED_CTRL_LINK_10;
+-	if (flags & BIT(TRIGGER_NETDEV_LINK_100))
+-		mode |= RTL8168_LED_CTRL_LINK_100;
+-	if (flags & BIT(TRIGGER_NETDEV_LINK_1000))
+-		mode |= RTL8168_LED_CTRL_LINK_1000;
+-	if (flags & BIT(TRIGGER_NETDEV_TX))
+-		mode |= RTL8168_LED_CTRL_ACT;
+-
+-	return rtl8168_led_mod_ctrl(tp, 0x000f << shift, mode << shift);
+-}
+-
+-static int rtl8168_led_hw_control_get(struct led_classdev *led_cdev,
+-				      unsigned long *flags)
+-{
+-	struct r8169_led_classdev *ldev = lcdev_to_r8169_ldev(led_cdev);
+-	struct rtl8169_private *tp = netdev_priv(ldev->ndev);
+-	int shift = ldev->index * 4;
+-	int mode;
+-
+-	mode = rtl8168_get_led_mode(tp);
+-	if (mode < 0)
+-		return mode;
+-
+-	if (mode & RTL8168_LED_CTRL_OPTION2) {
+-		rtl8168_led_mod_ctrl(tp, RTL8168_LED_CTRL_OPTION2, 0);
+-		netdev_notice(ldev->ndev, "Deactivating unsupported Option2 LED mode\n");
+-	}
+-
+-	mode = (mode >> shift) & 0x000f;
+-
+-	if (mode & RTL8168_LED_CTRL_ACT)
+-		*flags |= BIT(TRIGGER_NETDEV_TX) | BIT(TRIGGER_NETDEV_RX);
+-
+-	if (mode & RTL8168_LED_CTRL_LINK_10)
+-		*flags |= BIT(TRIGGER_NETDEV_LINK_10);
+-	if (mode & RTL8168_LED_CTRL_LINK_100)
+-		*flags |= BIT(TRIGGER_NETDEV_LINK_100);
+-	if (mode & RTL8168_LED_CTRL_LINK_1000)
+-		*flags |= BIT(TRIGGER_NETDEV_LINK_1000);
+-
+-	return 0;
+-}
+-
+-static struct device *
+-	r8169_led_hw_control_get_device(struct led_classdev *led_cdev)
+-{
+-	struct r8169_led_classdev *ldev = lcdev_to_r8169_ldev(led_cdev);
+-
+-	return &ldev->ndev->dev;
+-}
+-
+-static void rtl8168_setup_ldev(struct r8169_led_classdev *ldev,
+-			       struct net_device *ndev, int index)
+-{
+-	struct rtl8169_private *tp = netdev_priv(ndev);
+-	struct led_classdev *led_cdev = &ldev->led;
+-	char led_name[LED_MAX_NAME_SIZE];
+-
+-	ldev->ndev = ndev;
+-	ldev->index = index;
+-
+-	r8169_get_led_name(tp, index, led_name, LED_MAX_NAME_SIZE);
+-	led_cdev->name = led_name;
+-	led_cdev->default_trigger = "netdev";
+-	led_cdev->hw_control_trigger = "netdev";
+-	led_cdev->flags |= LED_RETAIN_AT_SHUTDOWN;
+-	led_cdev->hw_control_is_supported = rtl8168_led_hw_control_is_supported;
+-	led_cdev->hw_control_set = rtl8168_led_hw_control_set;
+-	led_cdev->hw_control_get = rtl8168_led_hw_control_get;
+-	led_cdev->hw_control_get_device = r8169_led_hw_control_get_device;
+-
+-	/* ignore errors */
+-	devm_led_classdev_register(&ndev->dev, led_cdev);
+-}
+-
+-void rtl8168_init_leds(struct net_device *ndev)
+-{
+-	/* bind resource mgmt to netdev */
+-	struct device *dev = &ndev->dev;
+-	struct r8169_led_classdev *leds;
+-	int i;
+-
+-	leds = devm_kcalloc(dev, RTL8168_NUM_LEDS, sizeof(*leds), GFP_KERNEL);
+-	if (!leds)
+-		return;
+-
+-	for (i = 0; i < RTL8168_NUM_LEDS; i++)
+-		rtl8168_setup_ldev(leds + i, ndev, i);
+-}
+diff --git a/r8169_8168h_only/r8169_main.c b/r8169_8168h_only/r8169_main.c
+index f0e0931..35e2679 100644
+--- a/r8169_8168h_only/r8169_main.c
++++ b/r8169_8168h_only/r8169_main.c
+@@ -13,7 +13,6 @@
+ #include <linux/pci.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+-#include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/ethtool.h>
+ #include <linux/phy.h>
+@@ -24,7 +23,6 @@
+ #include <linux/tcp.h>
+ #include <linux/interrupt.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/pm_runtime.h>
+ #include <linux/bitfield.h>
+ #include <linux/prefetch.h>
+ #include <linux/ipv6.h>
+@@ -40,7 +38,6 @@
+ #define TX_DMA_BURST	7	/* Maximum PCI burst, '7' is unlimited */
+ #define InterFrameGap	0x03	/* 3 means InterFrameGap = the shortest one */
+ 
+-#define R8169_REGS_SIZE		256
+ #define R8169_RX_BUF_SIZE	(SZ_16K - 1)
+ #define NUM_TX_DESC	256	/* Number of Tx descriptor registers */
+ #define NUM_RX_DESC	256	/* Number of Rx descriptor registers */
+@@ -59,11 +56,6 @@
+ #define RTL_R16(tp, reg)		readw(tp->mmio_addr + (reg))
+ #define RTL_R32(tp, reg)		readl(tp->mmio_addr + (reg))
+ 
+-#define JUMBO_4K	(4 * SZ_1K - VLAN_ETH_HLEN - ETH_FCS_LEN)
+-#define JUMBO_6K	(6 * SZ_1K - VLAN_ETH_HLEN - ETH_FCS_LEN)
+-#define JUMBO_7K	(7 * SZ_1K - VLAN_ETH_HLEN - ETH_FCS_LEN)
+-#define JUMBO_9K	(9 * SZ_1K - VLAN_ETH_HLEN - ETH_FCS_LEN)
+-
+ static const struct {
+ 	const char *name;
+ 	const char *fw_name;
+@@ -515,7 +507,6 @@ struct rtl8169_private {
+ 	u16 cp_cmd;
+ 	u32 irq_mask;
+ 	int irq;
+-	struct clk *clk;
+ 
+ 	struct {
+ 		DECLARE_BITMAP(flags, RTL_FLAG_MAX);
+@@ -524,7 +515,6 @@ struct rtl8169_private {
+ 
+ 	raw_spinlock_t config25_lock;
+ 	raw_spinlock_t mac_ocp_lock;
+-	struct mutex led_lock;	/* serialize LED ctrl RMW access */
+ 
+ 	raw_spinlock_t cfg9346_usage_lock;
+ 	int cfg9346_usage_count;
+@@ -534,8 +524,6 @@ struct rtl8169_private {
+ 	dma_addr_t counters_phys_addr;
+ 	struct rtl8169_counters *counters;
+ 	struct rtl8169_tc_offsets tc_offset;
+-	u32 saved_wolopts;
+-	int eee_adv;
+ 
+ 	const char *fw_name;
+ 	struct rtl_fw *rtl_fw;
+@@ -656,62 +644,6 @@ static const struct rtl_cond name = {			\
+ 							\
+ static bool name ## _check(struct rtl8169_private *tp)
+ 
+-int rtl8168_led_mod_ctrl(struct rtl8169_private *tp, u16 mask, u16 val)
+-{
+-	struct device *dev = tp_to_dev(tp);
+-	int ret;
+-
+-	ret = pm_runtime_resume_and_get(dev);
+-	if (ret < 0)
+-		return ret;
+-
+-	mutex_lock(&tp->led_lock);
+-	RTL_W16(tp, LED_CTRL, (RTL_R16(tp, LED_CTRL) & ~mask) | val);
+-	mutex_unlock(&tp->led_lock);
+-
+-	pm_runtime_put_sync(dev);
+-
+-	return 0;
+-}
+-
+-int rtl8168_get_led_mode(struct rtl8169_private *tp)
+-{
+-	struct device *dev = tp_to_dev(tp);
+-	int ret;
+-
+-	ret = pm_runtime_resume_and_get(dev);
+-	if (ret < 0)
+-		return ret;
+-
+-	ret = RTL_R16(tp, LED_CTRL);
+-
+-	pm_runtime_put_sync(dev);
+-
+-	return ret;
+-}
+-
+-void r8169_get_led_name(struct rtl8169_private *tp, int idx,
+-			char *buf, int buf_len)
+-{
+-	struct pci_dev *pdev = tp->pci_dev;
+-	char pdom[8], pfun[8];
+-	int domain;
+-
+-	domain = pci_domain_nr(pdev->bus);
+-	if (domain)
+-		snprintf(pdom, sizeof(pdom), "P%d", domain);
+-	else
+-		pdom[0] = '\0';
+-
+-	if (pdev->multifunction)
+-		snprintf(pfun, sizeof(pfun), "f%d", PCI_FUNC(pdev->devfn));
+-	else
+-		pfun[0] = '\0';
+-
+-	snprintf(buf, buf_len, "en%sp%ds%d%s-%d::lan", pdom, pdev->bus->number,
+-		 PCI_SLOT(pdev->devfn), pfun, idx);
+-}
+-
+ DECLARE_RTL_COND(rtl_eriar_cond)
+ {
+ 	return RTL_R32(tp, ERIAR) & ERIAR_FLAG;
+@@ -928,18 +860,6 @@ static u16 rtl_ephy_read(struct rtl8169_private *tp, int reg_addr)
+ 		RTL_R32(tp, EPHYAR) & EPHYAR_DATA_MASK : ~0;
+ }
+ 
+-#define OOB_CMD_RESET		0x00
+-#define OOB_CMD_DRIVER_START	0x05
+-#define OOB_CMD_DRIVER_STOP	0x06
+-
+-static void rtl_set_d3_pll_down(struct rtl8169_private *tp, bool enable)
+-{
+-	if (enable)
+-		RTL_W8(tp, PMCH, RTL_R8(tp, PMCH) & ~D3_NO_PLL_DOWN);
+-	else
+-		RTL_W8(tp, PMCH, RTL_R8(tp, PMCH) | D3_NO_PLL_DOWN);
+-}
+-
+ static void rtl_reset_packet_filter(struct rtl8169_private *tp)
+ {
+ 	rtl_eri_clear_bits(tp, 0xdc, BIT(0));
+@@ -991,77 +911,6 @@ static void rtl_link_chg_patch(struct rtl8169_private *tp)
+ 	(void)tp;
+ }
+ 
+-#define WAKE_ANY (WAKE_PHY | WAKE_MAGIC | WAKE_UCAST | WAKE_BCAST | WAKE_MCAST)
+-
+-static void rtl8169_get_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	wol->supported = WAKE_ANY;
+-	wol->wolopts = tp->saved_wolopts;
+-}
+-
+-static void __rtl8169_set_wol(struct rtl8169_private *tp, u32 wolopts)
+-{
+-	static const struct {
+-		u32 opt;
+-		u16 reg;
+-		u8  mask;
+-	} cfg[] = {
+-		{ WAKE_PHY,   Config3, LinkUp },
+-		{ WAKE_UCAST, Config5, UWF },
+-		{ WAKE_BCAST, Config5, BWF },
+-		{ WAKE_MCAST, Config5, MWF },
+-		{ WAKE_ANY,   Config5, LanWake },
+-		{ WAKE_MAGIC, Config3, MagicPacket }
+-	};
+-	unsigned int i, tmp = ARRAY_SIZE(cfg);
+-	unsigned long flags;
+-	u8 options;
+-
+-	rtl_unlock_config_regs(tp);
+-
+-	tmp--;
+-	if (wolopts & WAKE_MAGIC)
+-		rtl_eri_set_bits(tp, 0x0dc, MagicPacket_v2);
+-	else
+-		rtl_eri_clear_bits(tp, 0x0dc, MagicPacket_v2);
+-
+-	raw_spin_lock_irqsave(&tp->config25_lock, flags);
+-	for (i = 0; i < tmp; i++) {
+-		options = RTL_R8(tp, cfg[i].reg) & ~cfg[i].mask;
+-		if (wolopts & cfg[i].opt)
+-			options |= cfg[i].mask;
+-		RTL_W8(tp, cfg[i].reg, options);
+-	}
+-	raw_spin_unlock_irqrestore(&tp->config25_lock, flags);
+-
+-	if (wolopts)
+-		rtl_mod_config2(tp, 0, PME_SIGNAL);
+-	else
+-		rtl_mod_config2(tp, PME_SIGNAL, 0);
+-
+-	rtl_lock_config_regs(tp);
+-
+-	device_set_wakeup_enable(tp_to_dev(tp), wolopts);
+-
+-	rtl_set_d3_pll_down(tp, !wolopts);
+-	tp->dev->wol_enabled = wolopts ? 1 : 0;
+-}
+-
+-static int rtl8169_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	if (wol->wolopts & ~WAKE_ANY)
+-		return -EINVAL;
+-
+-	tp->saved_wolopts = wol->wolopts;
+-	__rtl8169_set_wol(tp, tp->saved_wolopts);
+-
+-	return 0;
+-}
+-
+ static void rtl8169_get_drvinfo(struct net_device *dev,
+ 				struct ethtool_drvinfo *info)
+ {
+@@ -1076,11 +925,6 @@ static void rtl8169_get_drvinfo(struct net_device *dev,
+ 			sizeof(info->fw_version));
+ }
+ 
+-static int rtl8169_get_regs_len(struct net_device *dev)
+-{
+-	return R8169_REGS_SIZE;
+-}
+-
+ static void rtl_set_rx_config_defaults(struct rtl8169_private *tp)
+ {
+ 	u32 rx_config = RTL_R32(tp, RxConfig);
+@@ -1090,18 +934,6 @@ static void rtl_set_rx_config_defaults(struct rtl8169_private *tp)
+ 	RTL_W32(tp, RxConfig, rx_config);
+ }
+ 
+-static void rtl8169_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+-			     void *p)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-	u32 __iomem *data = tp->mmio_addr;
+-	u32 *dw = p;
+-	int i;
+-
+-	for (i = 0; i < R8169_REGS_SIZE; i += 4)
+-		memcpy_fromio(dw++, data++, 4);
+-}
+-
+ static const char rtl8169_gstrings[][ETH_GSTRING_LEN] = {
+ 	"tx_packets",
+ 	"rx_packets",
+@@ -1200,269 +1032,16 @@ static void rtl8169_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+ 	}
+ }
+ 
+-/*
+- * Interrupt coalescing
+- *
+- * > 1 - the availability of the IntrMitigate (0xe2) register through the
+- * >     8169, 8168 and 810x line of chipsets
+- *
+- * 8169, 8168, and 8136(810x) serial chipsets support it.
+- *
+- * > 2 - the Tx timer unit at gigabit speed
+- *
+- * The unit of the timer depends on both the speed and the setting of CPlusCmd
+- * (0xe0) bit 1 and bit 0.
+- *
+- * For 8169
+- * bit[1:0] \ speed        1000M           100M            10M
+- * 0 0                     320ns           2.56us          40.96us
+- * 0 1                     2.56us          20.48us         327.7us
+- * 1 0                     5.12us          40.96us         655.4us
+- * 1 1                     10.24us         81.92us         1.31ms
+- *
+- * For the other
+- * bit[1:0] \ speed        1000M           100M            10M
+- * 0 0                     5us             2.56us          40.96us
+- * 0 1                     40us            20.48us         327.7us
+- * 1 0                     80us            40.96us         655.4us
+- * 1 1                     160us           81.92us         1.31ms
+- */
+-
+-/* rx/tx scale factors for all CPlusCmd[0:1] cases */
+-struct rtl_coalesce_info {
+-	u32 speed;
+-	u32 scale_nsecs[4];
+-};
+-
+-/* produce array with base delay *1, *8, *8*2, *8*2*2 */
+-#define COALESCE_DELAY(d) { (d), 8 * (d), 16 * (d), 32 * (d) }
+-
+-static const struct rtl_coalesce_info rtl_coalesce_info_8168_8136[] = {
+-	{ SPEED_1000,	COALESCE_DELAY(5000) },
+-	{ SPEED_100,	COALESCE_DELAY(2560) },
+-	{ SPEED_10,	COALESCE_DELAY(40960) },
+-	{ 0 },
+-};
+-#undef COALESCE_DELAY
+-
+-/* get rx/tx scale vector corresponding to current speed */
+-static const struct rtl_coalesce_info *
+-rtl_coalesce_info(struct rtl8169_private *tp)
+-{
+-	const struct rtl_coalesce_info *ci = rtl_coalesce_info_8168_8136;
+-
+-	/* if speed is unknown assume highest one */
+-	if (tp->phydev->speed == SPEED_UNKNOWN)
+-		return ci;
+-
+-	for (; ci->speed; ci++) {
+-		if (tp->phydev->speed == ci->speed)
+-			return ci;
+-	}
+-
+-	return ERR_PTR(-ELNRNG);
+-}
+-
+-static int rtl_get_coalesce(struct net_device *dev,
+-			    struct ethtool_coalesce *ec,
+-			    struct kernel_ethtool_coalesce *kernel_coal,
+-			    struct netlink_ext_ack *extack)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-	const struct rtl_coalesce_info *ci;
+-	u32 scale, c_us, c_fr;
+-	u16 intrmit;
+-
+-	memset(ec, 0, sizeof(*ec));
+-
+-	/* get rx/tx scale corresponding to current speed and CPlusCmd[0:1] */
+-	ci = rtl_coalesce_info(tp);
+-	if (IS_ERR(ci))
+-		return PTR_ERR(ci);
+-
+-	scale = ci->scale_nsecs[tp->cp_cmd & INTT_MASK];
+-
+-	intrmit = RTL_R16(tp, IntrMitigate);
+-
+-	c_us = FIELD_GET(RTL_COALESCE_TX_USECS, intrmit);
+-	ec->tx_coalesce_usecs = DIV_ROUND_UP(c_us * scale, 1000);
+-
+-	c_fr = FIELD_GET(RTL_COALESCE_TX_FRAMES, intrmit);
+-	/* ethtool_coalesce states usecs and max_frames must not both be 0 */
+-	ec->tx_max_coalesced_frames = (c_us || c_fr) ? c_fr * 4 : 1;
+-
+-	c_us = FIELD_GET(RTL_COALESCE_RX_USECS, intrmit);
+-	ec->rx_coalesce_usecs = DIV_ROUND_UP(c_us * scale, 1000);
+-
+-	c_fr = FIELD_GET(RTL_COALESCE_RX_FRAMES, intrmit);
+-	ec->rx_max_coalesced_frames = (c_us || c_fr) ? c_fr * 4 : 1;
+-
+-	return 0;
+-}
+-
+-/* choose appropriate scale factor and CPlusCmd[0:1] for (speed, usec) */
+-static int rtl_coalesce_choose_scale(struct rtl8169_private *tp, u32 usec,
+-				     u16 *cp01)
+-{
+-	const struct rtl_coalesce_info *ci;
+-	u16 i;
+-
+-	ci = rtl_coalesce_info(tp);
+-	if (IS_ERR(ci))
+-		return PTR_ERR(ci);
+-
+-	for (i = 0; i < 4; i++) {
+-		if (usec <= ci->scale_nsecs[i] * RTL_COALESCE_T_MAX / 1000U) {
+-			*cp01 = i;
+-			return ci->scale_nsecs[i];
+-		}
+-	}
+-
+-	return -ERANGE;
+-}
+-
+-static int rtl_set_coalesce(struct net_device *dev,
+-			    struct ethtool_coalesce *ec,
+-			    struct kernel_ethtool_coalesce *kernel_coal,
+-			    struct netlink_ext_ack *extack)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-	u32 tx_fr = ec->tx_max_coalesced_frames;
+-	u32 rx_fr = ec->rx_max_coalesced_frames;
+-	u32 coal_usec_max, units;
+-	u16 w = 0, cp01 = 0;
+-	int scale;
+-
+-	if (rx_fr > RTL_COALESCE_FRAME_MAX || tx_fr > RTL_COALESCE_FRAME_MAX)
+-		return -ERANGE;
+-
+-	coal_usec_max = max(ec->rx_coalesce_usecs, ec->tx_coalesce_usecs);
+-	scale = rtl_coalesce_choose_scale(tp, coal_usec_max, &cp01);
+-	if (scale < 0)
+-		return scale;
+-
+-	/* Accept max_frames=1 we returned in rtl_get_coalesce. Accept it
+-	 * not only when usecs=0 because of e.g. the following scenario:
+-	 *
+-	 * - both rx_usecs=0 & rx_frames=0 in hardware (no delay on RX)
+-	 * - rtl_get_coalesce returns rx_usecs=0, rx_frames=1
+-	 * - then user does `ethtool -C eth0 rx-usecs 100`
+-	 *
+-	 * Since ethtool sends to kernel whole ethtool_coalesce settings,
+-	 * if we want to ignore rx_frames then it has to be set to 0.
+-	 */
+-	if (rx_fr == 1)
+-		rx_fr = 0;
+-	if (tx_fr == 1)
+-		tx_fr = 0;
+-
+-	/* HW requires time limit to be set if frame limit is set */
+-	if ((tx_fr && !ec->tx_coalesce_usecs) ||
+-	    (rx_fr && !ec->rx_coalesce_usecs))
+-		return -EINVAL;
+-
+-	w |= FIELD_PREP(RTL_COALESCE_TX_FRAMES, DIV_ROUND_UP(tx_fr, 4));
+-	w |= FIELD_PREP(RTL_COALESCE_RX_FRAMES, DIV_ROUND_UP(rx_fr, 4));
+-
+-	units = DIV_ROUND_UP(ec->tx_coalesce_usecs * 1000U, scale);
+-	w |= FIELD_PREP(RTL_COALESCE_TX_USECS, units);
+-	units = DIV_ROUND_UP(ec->rx_coalesce_usecs * 1000U, scale);
+-	w |= FIELD_PREP(RTL_COALESCE_RX_USECS, units);
+-
+-	RTL_W16(tp, IntrMitigate, w);
+-
+-	if (!rx_fr && !tx_fr)
+-		tp->cp_cmd |= PktCntrDisable;
+-	else
+-		tp->cp_cmd &= ~PktCntrDisable;
+-
+-	tp->cp_cmd = (tp->cp_cmd & ~INTT_MASK) | cp01;
+-	RTL_W16(tp, CPlusCmd, tp->cp_cmd);
+-	rtl_pci_commit(tp);
+-
+-	return 0;
+-}
+-
+-static int rtl8169_get_eee(struct net_device *dev, struct ethtool_eee *data)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	return phy_ethtool_get_eee(tp->phydev, data);
+-}
+-
+-static int rtl8169_set_eee(struct net_device *dev, struct ethtool_eee *data)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-	int ret;
+-
+-	ret = phy_ethtool_set_eee(tp->phydev, data);
+-
+-	if (!ret)
+-		tp->eee_adv = phy_read_mmd(dev->phydev, MDIO_MMD_AN,
+-					   MDIO_AN_EEE_ADV);
+-	return ret;
+-}
+-
+-static void rtl8169_get_ringparam(struct net_device *dev,
+-				  struct ethtool_ringparam *data,
+-				  struct kernel_ethtool_ringparam *kernel_data,
+-				  struct netlink_ext_ack *extack)
+-{
+-	data->rx_max_pending = NUM_RX_DESC;
+-	data->rx_pending = NUM_RX_DESC;
+-	data->tx_max_pending = NUM_TX_DESC;
+-	data->tx_pending = NUM_TX_DESC;
+-}
+-
+-static void rtl8169_get_pauseparam(struct net_device *dev,
+-				   struct ethtool_pauseparam *data)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-	bool tx_pause, rx_pause;
+-
+-	phy_get_pause(tp->phydev, &tx_pause, &rx_pause);
+-
+-	data->autoneg = tp->phydev->autoneg;
+-	data->tx_pause = tx_pause ? 1 : 0;
+-	data->rx_pause = rx_pause ? 1 : 0;
+-}
+-
+-static int rtl8169_set_pauseparam(struct net_device *dev,
+-				  struct ethtool_pauseparam *data)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	if (dev->mtu > ETH_DATA_LEN)
+-		return -EOPNOTSUPP;
+-
+-	phy_set_asym_pause(tp->phydev, data->rx_pause, data->tx_pause);
+-
+-	return 0;
+-}
+-
+ static const struct ethtool_ops rtl8169_ethtool_ops = {
+-	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+-				     ETHTOOL_COALESCE_MAX_FRAMES,
+ 	.get_drvinfo		= rtl8169_get_drvinfo,
+-	.get_regs_len		= rtl8169_get_regs_len,
+ 	.get_link		= ethtool_op_get_link,
+-	.get_coalesce		= rtl_get_coalesce,
+-	.set_coalesce		= rtl_set_coalesce,
+-	.get_regs		= rtl8169_get_regs,
+-	.get_wol		= rtl8169_get_wol,
+-	.set_wol		= rtl8169_set_wol,
+ 	.get_strings		= rtl8169_get_strings,
+ 	.get_sset_count		= rtl8169_get_sset_count,
+ 	.get_ethtool_stats	= rtl8169_get_ethtool_stats,
+ 	.get_ts_info		= ethtool_op_get_ts_info,
+ 	.nway_reset		= phy_ethtool_nway_reset,
+-	.get_eee		= rtl8169_get_eee,
+-	.set_eee		= rtl8169_set_eee,
+ 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
+-	.get_ringparam		= rtl8169_get_ringparam,
+-	.get_pauseparam		= rtl8169_get_pauseparam,
+-	.set_pauseparam		= rtl8169_set_pauseparam,
+ };
+ 
+ static void rtl_enable_eee(struct rtl8169_private *tp)
+@@ -1470,11 +1049,7 @@ static void rtl_enable_eee(struct rtl8169_private *tp)
+ 	struct phy_device *phydev = tp->phydev;
+ 	int adv;
+ 
+-	/* respect EEE advertisement the user may have set */
+-	if (tp->eee_adv >= 0)
+-		adv = tp->eee_adv;
+-	else
+-		adv = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
++	adv = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
+ 
+ 	if (adv >= 0)
+ 		phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, adv);
+@@ -1594,24 +1169,6 @@ static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
+ 	tp->dirty_tx = tp->cur_tx = tp->cur_rx = 0;
+ }
+ 
+-static void rtl_jumbo_config(struct rtl8169_private *tp)
+-{
+-	bool jumbo = tp->dev->mtu > ETH_DATA_LEN;
+-	int readrq = 4096;
+-
+-	if (pci_is_pcie(tp->pci_dev))
+-		pcie_set_readrq(tp->pci_dev, readrq);
+-
+-	/* Chip doesn't support pause in jumbo mode */
+-	if (jumbo) {
+-		linkmode_clear_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+-				   tp->phydev->advertising);
+-		linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
+-				   tp->phydev->advertising);
+-		phy_start_aneg(tp->phydev);
+-	}
+-}
+-
+ DECLARE_RTL_COND(rtl_chipcmd_cond)
+ {
+ 	return RTL_R8(tp, ChipCmd) & CmdReset;
+@@ -1683,21 +1240,6 @@ static void rtl_enable_rxdvgate(struct rtl8169_private *tp)
+ 	rtl_wait_txrx_fifo_empty(tp);
+ }
+ 
+-static void rtl_wol_enable_rx(struct rtl8169_private *tp)
+-{
+-	RTL_W32(tp, RxConfig, RTL_R32(tp, RxConfig) |
+-		AcceptBroadcast | AcceptMulticast | AcceptMyPhys);
+-	rtl_disable_rxdvgate(tp);
+-}
+-
+-static void rtl_prepare_power_down(struct rtl8169_private *tp)
+-{
+-	if (device_may_wakeup(tp_to_dev(tp))) {
+-		phy_speed_down(tp->phydev, false);
+-		rtl_wol_enable_rx(tp);
+-	}
+-}
+-
+ static void rtl_set_tx_config_registers(struct rtl8169_private *tp)
+ {
+ 	u32 val = TX_DMA_BURST << TxDMAShift |
+@@ -1726,38 +1268,13 @@ static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
+ 	RTL_W32(tp, RxDescAddrLow, ((u64) tp->RxPhyAddr) & DMA_BIT_MASK(32));
+ }
+ 
+-static void rtl_set_rx_mode(struct net_device *dev)
++static void rtl_set_rx_mode(struct rtl8169_private *tp)
+ {
+ 	u32 rx_mode = AcceptBroadcast | AcceptMyPhys | AcceptMulticast;
+-	/* Multicast hash filter */
+-	u32 mc_filter[2] = { 0xffffffff, 0xffffffff };
+-	struct rtl8169_private *tp = netdev_priv(dev);
+ 	u32 tmp;
+ 
+-	if (dev->flags & IFF_PROMISC) {
+-		rx_mode |= AcceptAllPhys;
+-	} else if (!(dev->flags & IFF_MULTICAST)) {
+-		rx_mode &= ~AcceptMulticast;
+-	} else if (dev->flags & IFF_ALLMULTI) {
+-		/* accept all multicasts */
+-	} else if (netdev_mc_empty(dev)) {
+-		rx_mode &= ~AcceptMulticast;
+-	} else {
+-		struct netdev_hw_addr *ha;
+-
+-		mc_filter[1] = mc_filter[0] = 0;
+-		netdev_for_each_mc_addr(ha, dev) {
+-			u32 bit_nr = eth_hw_addr_crc(ha) >> 26;
+-			mc_filter[bit_nr >> 5] |= BIT(bit_nr & 31);
+-		}
+-
+-		tmp = mc_filter[0];
+-		mc_filter[0] = swab32(mc_filter[1]);
+-		mc_filter[1] = swab32(tmp);
+-	}
+-
+-	RTL_W32(tp, MAR0 + 4, mc_filter[1]);
+-	RTL_W32(tp, MAR0 + 0, mc_filter[0]);
++	RTL_W32(tp, MAR0 + 4, 0xffffffff);
++	RTL_W32(tp, MAR0 + 0, 0xffffffff);
+ 
+ 	tmp = RTL_R32(tp, RxConfig);
+ 	RTL_W32(tp, RxConfig, (tmp & ~RX_CONFIG_ACCEPT_OK_MASK) | rx_mode);
+@@ -1969,12 +1486,12 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
+ 
+ 	rtl_enable_exit_l1(tp);
+ 	rtl_hw_aspm_clkreq_enable(tp, true);
++	if (pci_is_pcie(tp->pci_dev))
++		pcie_set_readrq(tp->pci_dev, 4096);
+ 	rtl_set_rx_max_size(tp);
+ 	rtl_set_rx_tx_desc_registers(tp);
+ 	rtl_lock_config_regs(tp);
+ 
+-	rtl_jumbo_config(tp);
+-
+ 	/* Initially a 10 us delay. Turned it into a PCI commit. - FR */
+ 	rtl_pci_commit(tp);
+ 
+@@ -1982,20 +1499,10 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
+ 	rtl_init_rxcfg(tp);
+ 	rtl_set_tx_config_registers(tp);
+ 	rtl_set_rx_config_defaults(tp);
+-	rtl_set_rx_mode(tp->dev);
++	rtl_set_rx_mode(tp);
+ 	rtl_irq_enable(tp);
+ }
+ 
+-static int rtl8169_change_mtu(struct net_device *dev, int new_mtu)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	dev->mtu = new_mtu;
+-	rtl_jumbo_config(tp);
+-
+-	return 0;
+-}
+-
+ static void rtl8169_mark_to_asic(struct RxDesc *desc)
+ {
+ 	u32 eor = le32_to_cpu(desc->opts1) & RingEnd;
+@@ -2559,14 +2066,10 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
+ static void r8169_phylink_handler(struct net_device *ndev)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(ndev);
+-	struct device *d = tp_to_dev(tp);
+ 
+ 	if (netif_carrier_ok(ndev)) {
+ 		rtl_link_chg_patch(tp);
+-		pm_request_resume(d);
+ 		netif_wake_queue(tp->dev);
+-	} else {
+-		pm_runtime_idle(d);
+ 	}
+ 
+ 	phy_print_status(tp->phydev);
+@@ -2601,7 +2104,6 @@ static void rtl8169_down(struct rtl8169_private *tp)
+ 
+ 	rtl8169_cleanup(tp);
+ 	rtl_disable_exit_l1(tp);
+-	rtl_prepare_power_down(tp);
+ }
+ 
+ static void rtl8169_up(struct rtl8169_private *tp)
+@@ -2622,8 +2124,6 @@ static int rtl8169_close(struct net_device *dev)
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 	struct pci_dev *pdev = tp->pci_dev;
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+-
+ 	netif_stop_queue(dev);
+ 	rtl8169_down(tp);
+ 	rtl8169_rx_clear(tp);
+@@ -2641,20 +2141,9 @@ static int rtl8169_close(struct net_device *dev)
+ 	tp->TxDescArray = NULL;
+ 	tp->RxDescArray = NULL;
+ 
+-	pm_runtime_put_sync(&pdev->dev);
+-
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-static void rtl8169_netpoll(struct net_device *dev)
+-{
+-	struct rtl8169_private *tp = netdev_priv(dev);
+-
+-	rtl8169_interrupt(tp->irq, tp);
+-}
+-#endif
+-
+ static int rtl_open(struct net_device *dev)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+@@ -2662,8 +2151,6 @@ static int rtl_open(struct net_device *dev)
+ 	unsigned long irqflags;
+ 	int retval = -ENOMEM;
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+-
+ 	/*
+ 	 * Rx and Tx descriptors needs 256 bytes alignment.
+ 	 * dma_alloc_coherent provides more.
+@@ -2671,7 +2158,7 @@ static int rtl_open(struct net_device *dev)
+ 	tp->TxDescArray = dma_alloc_coherent(&pdev->dev, R8169_TX_RING_BYTES,
+ 					     &tp->TxPhyAddr, GFP_KERNEL);
+ 	if (!tp->TxDescArray)
+-		goto out;
++		return retval;
+ 
+ 	tp->RxDescArray = dma_alloc_coherent(&pdev->dev, R8169_RX_RING_BYTES,
+ 					     &tp->RxPhyAddr, GFP_KERNEL);
+@@ -2696,9 +2183,6 @@ static int rtl_open(struct net_device *dev)
+ 	rtl8169_up(tp);
+ 	rtl8169_init_counter_offsets(tp);
+ 	netif_start_queue(dev);
+-out:
+-	pm_runtime_put_sync(&pdev->dev);
+-
+ 	return retval;
+ 
+ err_free_irq:
+@@ -2714,18 +2198,15 @@ err_free_tx_0:
+ 	dma_free_coherent(&pdev->dev, R8169_TX_RING_BYTES, tp->TxDescArray,
+ 			  tp->TxPhyAddr);
+ 	tp->TxDescArray = NULL;
+-	goto out;
++	return retval;
+ }
+ 
+ static void
+ rtl8169_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+-	struct pci_dev *pdev = tp->pci_dev;
+ 	struct rtl8169_counters *counters = tp->counters;
+ 
+-	pm_runtime_get_noresume(&pdev->dev);
+-
+ 	netdev_stats_to_stats64(stats, &dev->stats);
+ 	dev_fetch_sw_netstats(stats, dev->tstats);
+ 
+@@ -2733,8 +2214,7 @@ rtl8169_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ 	 * Fetch additional counter values missing in stats collected by driver
+ 	 * from tally counters.
+ 	 */
+-	if (pm_runtime_active(&pdev->dev))
+-		rtl8169_update_counters(tp);
++	rtl8169_update_counters(tp);
+ 
+ 	/*
+ 	 * Subtract values fetched during initalization.
+@@ -2748,102 +2228,23 @@ rtl8169_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ 		le16_to_cpu(tp->tc_offset.tx_aborted);
+ 	stats->rx_missed_errors = le16_to_cpu(counters->rx_missed) -
+ 		le16_to_cpu(tp->tc_offset.rx_missed);
+-
+-	pm_runtime_put_noidle(&pdev->dev);
+-}
+-
+-static void rtl8169_net_suspend(struct rtl8169_private *tp)
+-{
+-	netif_device_detach(tp->dev);
+-
+-	if (netif_running(tp->dev))
+-		rtl8169_down(tp);
+-}
+-
+-static int rtl8169_runtime_resume(struct device *dev)
+-{
+-	struct rtl8169_private *tp = dev_get_drvdata(dev);
+-
+-	rtl_rar_set(tp, tp->dev->dev_addr);
+-	__rtl8169_set_wol(tp, tp->saved_wolopts);
+-
+-	if (tp->TxDescArray)
+-		rtl8169_up(tp);
+-
+-	netif_device_attach(tp->dev);
+-
+-	return 0;
+-}
+-
+-static int rtl8169_suspend(struct device *device)
+-{
+-	struct rtl8169_private *tp = dev_get_drvdata(device);
+-
+-	rtnl_lock();
+-	rtl8169_net_suspend(tp);
+-	if (!device_may_wakeup(tp_to_dev(tp)))
+-		clk_disable_unprepare(tp->clk);
+-	rtnl_unlock();
+-
+-	return 0;
+-}
+-
+-static int rtl8169_resume(struct device *device)
+-{
+-	struct rtl8169_private *tp = dev_get_drvdata(device);
+-
+-	if (!device_may_wakeup(tp_to_dev(tp)))
+-		clk_prepare_enable(tp->clk);
+-
+-	return rtl8169_runtime_resume(device);
+ }
+ 
+-static int rtl8169_runtime_suspend(struct device *device)
+-{
+-	struct rtl8169_private *tp = dev_get_drvdata(device);
+-
+-	if (!tp->TxDescArray) {
+-		netif_device_detach(tp->dev);
+-		return 0;
+-	}
+-
+-	rtnl_lock();
+-	__rtl8169_set_wol(tp, WAKE_PHY);
+-	rtl8169_net_suspend(tp);
+-	rtnl_unlock();
+-
+-	return 0;
+-}
+-
+-static int rtl8169_runtime_idle(struct device *device)
+-{
+-	struct rtl8169_private *tp = dev_get_drvdata(device);
+-
+-	if (!netif_running(tp->dev) || !netif_carrier_ok(tp->dev))
+-		pm_schedule_suspend(device, 10000);
+-
+-	return -EBUSY;
+-}
+-
+-static const struct dev_pm_ops rtl8169_pm_ops = {
+-	SYSTEM_SLEEP_PM_OPS(rtl8169_suspend, rtl8169_resume)
+-	RUNTIME_PM_OPS(rtl8169_runtime_suspend, rtl8169_runtime_resume,
+-		       rtl8169_runtime_idle)
+-};
+-
+ static void rtl_shutdown(struct pci_dev *pdev)
+ {
+ 	struct rtl8169_private *tp = pci_get_drvdata(pdev);
+ 
+ 	rtnl_lock();
+-	rtl8169_net_suspend(tp);
++	netif_device_detach(tp->dev);
++	if (netif_running(tp->dev))
++		rtl8169_down(tp);
+ 	rtnl_unlock();
+ 
+ 	/* Restore original MAC address */
+ 	rtl_rar_set(tp, tp->dev->perm_addr);
+ 
+ 	if (system_state == SYSTEM_POWER_OFF) {
+-		pci_wake_from_d3(pdev, tp->saved_wolopts);
++		pci_wake_from_d3(pdev, false);
+ 		pci_set_power_state(pdev, PCI_D3hot);
+ 	}
+ }
+@@ -2852,9 +2253,6 @@ static void rtl_remove_one(struct pci_dev *pdev)
+ {
+ 	struct rtl8169_private *tp = pci_get_drvdata(pdev);
+ 
+-	if (pci_dev_run_wake(pdev))
+-		pm_runtime_get_noresume(&pdev->dev);
+-
+ 	cancel_work_sync(&tp->wk.work);
+ 
+ 	unregister_netdev(tp->dev);
+@@ -2873,14 +2271,7 @@ static const struct net_device_ops rtl_netdev_ops = {
+ 	.ndo_features_check	= rtl8169_features_check,
+ 	.ndo_tx_timeout		= rtl8169_tx_timeout,
+ 	.ndo_validate_addr	= eth_validate_addr,
+-	.ndo_change_mtu		= rtl8169_change_mtu,
+ 	.ndo_set_mac_address	= rtl_set_mac_address,
+-	.ndo_eth_ioctl		= phy_do_ioctl_running,
+-	.ndo_set_rx_mode	= rtl_set_rx_mode,
+-#ifdef CONFIG_NET_POLL_CONTROLLER
+-	.ndo_poll_controller	= rtl8169_netpoll,
+-#endif
+-
+ };
+ 
+ static void rtl_set_irq_mask(struct rtl8169_private *tp)
+@@ -2974,8 +2365,6 @@ static int r8169_mdio_register(struct rtl8169_private *tp)
+ 		return -EUNATCH;
+ 	}
+ 
+-	tp->phydev->mac_managed_pm = true;
+-
+ 	phy_support_asym_pause(tp->phydev);
+ 
+ 	/* PHY will be woken up in rtl_open() */
+@@ -3004,12 +2393,6 @@ static void rtl_hw_initialize(struct rtl8169_private *tp)
+ 	rtl_hw_init_8168g(tp);
+ }
+ 
+-static int rtl_jumbo_max(struct rtl8169_private *tp)
+-{
+-	(void)tp;
+-	return JUMBO_9K;
+-}
+-
+ static void rtl_init_mac_address(struct rtl8169_private *tp)
+ {
+ 	u8 mac_addr[ETH_ALEN] __aligned(2) = {};
+@@ -3046,7 +2429,7 @@ static bool rtl_aspm_is_safe(struct rtl8169_private *tp)
+ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ {
+ 	struct rtl8169_private *tp;
+-	int jumbo_max, region, rc;
++	int region, rc;
+ 	struct net_device *dev;
+ 	u32 txconfig;
+ 	u16 xid;
+@@ -3063,24 +2446,17 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	tp->dev = dev;
+ 	tp->pci_dev = pdev;
+ 	tp->supports_gmii = 1;
+-	tp->eee_adv = -1;
+ 	tp->ocp_base = OCP_STD_PHY_BASE;
+ 
+ 	raw_spin_lock_init(&tp->cfg9346_usage_lock);
+ 	raw_spin_lock_init(&tp->config25_lock);
+ 	raw_spin_lock_init(&tp->mac_ocp_lock);
+-	mutex_init(&tp->led_lock);
+ 
+ 	dev->tstats = devm_netdev_alloc_pcpu_stats(&pdev->dev,
+ 						   struct pcpu_sw_netstats);
+ 	if (!dev->tstats)
+ 		return -ENOMEM;
+ 
+-	/* Get the *optional* external "ether_clk" used on some boards */
+-	tp->clk = devm_clk_get_optional_enabled(&pdev->dev, "ether_clk");
+-	if (IS_ERR(tp->clk))
+-		return dev_err_probe(&pdev->dev, PTR_ERR(tp->clk), "failed to get ether_clk\n");
+-
+ 	/* enable device (incl. PCI PM wakeup and hotplug setup) */
+ 	rc = pcim_enable_device(pdev);
+ 	if (rc < 0)
+@@ -3159,12 +2535,6 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 
+ 	netdev_sw_irq_coalesce_default_on(dev);
+ 
+-	rtl_set_d3_pll_down(tp, true);
+-
+-	jumbo_max = rtl_jumbo_max(tp);
+-	if (jumbo_max)
+-		dev->max_mtu = jumbo_max;
+-
+ 	rtl_set_irq_mask(tp);
+ 
+ 	tp->fw_name = rtl_chip_info.fw_name;
+@@ -3185,19 +2555,9 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (rc)
+ 		return rc;
+ 
+-	if (IS_ENABLED(CONFIG_R8169_LEDS))
+-		rtl8168_init_leds(dev);
+-
+ 	netdev_info(dev, "%s, %pM, XID %03x, IRQ %d\n",
+ 		    rtl_chip_info.name, dev->dev_addr, xid, tp->irq);
+ 
+-	if (jumbo_max)
+-		netdev_info(dev, "jumbo features [frames: %d bytes, tx checksumming: %s]\n",
+-			    jumbo_max, "ko");
+-
+-	if (pci_dev_run_wake(pdev))
+-		pm_runtime_put_sync(&pdev->dev);
+-
+ 	return 0;
+ }
+ 
+@@ -3207,7 +2567,6 @@ static struct pci_driver rtl8169_pci_driver = {
+ 	.probe		= rtl_init_one,
+ 	.remove		= rtl_remove_one,
+ 	.shutdown	= rtl_shutdown,
+-	.driver.pm	= pm_ptr(&rtl8169_pm_ops),
+ };
+ 
+ module_pci_driver(rtl8169_pci_driver);
