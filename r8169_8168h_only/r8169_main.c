@@ -496,12 +496,6 @@ enum rtl_flag {
 	RTL_FLAG_MAX
 };
 
-enum rtl_dash_type {
-	RTL_DASH_NONE,
-	RTL_DASH_DP,
-	RTL_DASH_EP,
-};
-
 struct rtl8169_private {
 	void __iomem *mmio_addr;	/* memory map physical address */
 	struct pci_dev *pci_dev;
@@ -509,7 +503,6 @@ struct rtl8169_private {
 	struct phy_device *phydev;
 	struct napi_struct napi;
 	enum mac_version mac_version;
-	enum rtl_dash_type dash_type;
 	u32 cur_rx; /* Index into the Rx descriptor buffer of next Rx pkt. */
 	u32 cur_tx; /* Index into the Tx descriptor buffer of next Rx pkt. */
 	u32 dirty_tx;
@@ -538,7 +531,6 @@ struct rtl8169_private {
 
 	unsigned supports_gmii:1;
 	unsigned aspm_manageable:1;
-	unsigned dash_enabled:1;
 	dma_addr_t counters_phys_addr;
 	struct rtl8169_counters *counters;
 	struct rtl8169_tc_offsets tc_offset;
@@ -720,15 +712,6 @@ void r8169_get_led_name(struct rtl8169_private *tp, int idx,
 		 PCI_SLOT(pdev->devfn), pfun, idx);
 }
 
-static void r8168fp_adjust_ocp_cmd(struct rtl8169_private *tp, u32 *cmd, int type)
-{
-	/* based on RTL8168FP_OOBMAC_BASE in vendor driver */
-	if (type == ERIAR_OOB &&
-	    (tp->mac_version == RTL_GIGA_MAC_VER_52 ||
-	     tp->mac_version == RTL_GIGA_MAC_VER_53))
-		*cmd |= 0xf70 << 18;
-}
-
 DECLARE_RTL_COND(rtl_eriar_cond)
 {
 	return RTL_R32(tp, ERIAR) & ERIAR_FLAG;
@@ -743,7 +726,6 @@ static void _rtl_eri_write(struct rtl8169_private *tp, int addr, u32 mask,
 		return;
 
 	RTL_W32(tp, ERIDR, val);
-	r8168fp_adjust_ocp_cmd(tp, &cmd, type);
 	RTL_W32(tp, ERIAR, cmd);
 
 	rtl_loop_wait_low(tp, &rtl_eriar_cond, 100, 100);
@@ -759,7 +741,6 @@ static u32 _rtl_eri_read(struct rtl8169_private *tp, int addr, int type)
 {
 	u32 cmd = ERIAR_READ_CMD | type | ERIAR_MASK_1111 | addr;
 
-	r8168fp_adjust_ocp_cmd(tp, &cmd, type);
 	RTL_W32(tp, ERIAR, cmd);
 
 	return rtl_loop_wait_high(tp, &rtl_eriar_cond, 100, 100) ?
@@ -870,23 +851,6 @@ static void r8168_mac_ocp_modify(struct rtl8169_private *tp, u32 reg, u16 mask,
 	raw_spin_unlock_irqrestore(&tp->mac_ocp_lock, flags);
 }
 
-/* Work around a hw issue with RTL8168g PHY, the quirk disables
- * PHY MCU interrupts before PHY power-down.
- */
-static void rtl8168g_phy_suspend_quirk(struct rtl8169_private *tp, int value)
-{
-	switch (tp->mac_version) {
-	case RTL_GIGA_MAC_VER_40:
-		if (value & BMCR_RESET || !(value & BMCR_PDOWN))
-			rtl_eri_set_bits(tp, 0x1a8, 0xfc000000);
-		else
-			rtl_eri_clear_bits(tp, 0x1a8, 0xfc000000);
-		break;
-	default:
-		break;
-	}
-};
-
 static void r8168g_mdio_write(struct rtl8169_private *tp, int reg, int value)
 {
 	if (reg == 0x1f) {
@@ -896,9 +860,6 @@ static void r8168g_mdio_write(struct rtl8169_private *tp, int reg, int value)
 
 	if (tp->ocp_base != OCP_STD_PHY_BASE)
 		reg -= 0x10;
-
-	if (tp->ocp_base == OCP_STD_PHY_BASE && reg == MII_BMCR)
-		rtl8168g_phy_suspend_quirk(tp, value);
 
 	r8168_phy_ocp_write(tp, tp->ocp_base + reg * 2, value);
 }
@@ -929,111 +890,19 @@ static int mac_mcu_read(struct rtl8169_private *tp, int reg)
 	return r8168_mac_ocp_read(tp, tp->ocp_base + reg);
 }
 
-DECLARE_RTL_COND(rtl_phyar_cond)
-{
-	return RTL_R32(tp, PHYAR) & 0x80000000;
-}
-
-static void r8169_mdio_write(struct rtl8169_private *tp, int reg, int value)
-{
-	RTL_W32(tp, PHYAR, 0x80000000 | (reg & 0x1f) << 16 | (value & 0xffff));
-
-	rtl_loop_wait_low(tp, &rtl_phyar_cond, 25, 20);
-	/*
-	 * According to hardware specs a 20us delay is required after write
-	 * complete indication, but before sending next command.
-	 */
-	udelay(20);
-}
-
-static int r8169_mdio_read(struct rtl8169_private *tp, int reg)
-{
-	int value;
-
-	RTL_W32(tp, PHYAR, 0x0 | (reg & 0x1f) << 16);
-
-	value = rtl_loop_wait_high(tp, &rtl_phyar_cond, 25, 20) ?
-		RTL_R32(tp, PHYAR) & 0xffff : -ETIMEDOUT;
-
-	/*
-	 * According to hardware specs a 20us delay is required after read
-	 * complete indication, but before sending next command.
-	 */
-	udelay(20);
-
-	return value;
-}
-
 DECLARE_RTL_COND(rtl_ocpar_cond)
 {
 	return RTL_R32(tp, OCPAR) & OCPAR_FLAG;
 }
 
-#define R8168DP_1_MDIO_ACCESS_BIT	0x00020000
-
-static void r8168dp_2_mdio_start(struct rtl8169_private *tp)
-{
-	RTL_W32(tp, 0xd0, RTL_R32(tp, 0xd0) & ~R8168DP_1_MDIO_ACCESS_BIT);
-}
-
-static void r8168dp_2_mdio_stop(struct rtl8169_private *tp)
-{
-	RTL_W32(tp, 0xd0, RTL_R32(tp, 0xd0) | R8168DP_1_MDIO_ACCESS_BIT);
-}
-
-static void r8168dp_2_mdio_write(struct rtl8169_private *tp, int reg, int value)
-{
-	r8168dp_2_mdio_start(tp);
-
-	r8169_mdio_write(tp, reg, value);
-
-	r8168dp_2_mdio_stop(tp);
-}
-
-static int r8168dp_2_mdio_read(struct rtl8169_private *tp, int reg)
-{
-	int value;
-
-	/* Work around issue with chip reporting wrong PHY ID */
-	if (reg == MII_PHYSID2)
-		return 0xc912;
-
-	r8168dp_2_mdio_start(tp);
-
-	value = r8169_mdio_read(tp, reg);
-
-	r8168dp_2_mdio_stop(tp);
-
-	return value;
-}
-
 static void rtl_writephy(struct rtl8169_private *tp, int location, int val)
 {
-	switch (tp->mac_version) {
-	case RTL_GIGA_MAC_VER_28:
-	case RTL_GIGA_MAC_VER_31:
-		r8168dp_2_mdio_write(tp, location, val);
-		break;
-	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_63:
-		r8168g_mdio_write(tp, location, val);
-		break;
-	default:
-		r8169_mdio_write(tp, location, val);
-		break;
-	}
+	r8168g_mdio_write(tp, location, val);
 }
 
 static int rtl_readphy(struct rtl8169_private *tp, int location)
 {
-	switch (tp->mac_version) {
-	case RTL_GIGA_MAC_VER_28:
-	case RTL_GIGA_MAC_VER_31:
-		return r8168dp_2_mdio_read(tp, location);
-	case RTL_GIGA_MAC_VER_40 ... RTL_GIGA_MAC_VER_63:
-		return r8168g_mdio_read(tp, location);
-	default:
-		return r8169_mdio_read(tp, location);
-	}
+	return r8168g_mdio_read(tp, location);
 }
 
 DECLARE_RTL_COND(rtl_ephyar_cond)
@@ -1176,10 +1045,8 @@ static void __rtl8169_set_wol(struct rtl8169_private *tp, u32 wolopts)
 
 	device_set_wakeup_enable(tp_to_dev(tp), wolopts);
 
-	if (!tp->dash_enabled) {
-		rtl_set_d3_pll_down(tp, !wolopts);
-		tp->dev->wol_enabled = wolopts ? 1 : 0;
-	}
+	rtl_set_d3_pll_down(tp, !wolopts);
+	tp->dev->wol_enabled = wolopts ? 1 : 0;
 }
 
 static int rtl8169_set_wol(struct net_device *dev, struct ethtool_wolinfo *wol)
@@ -1345,35 +1212,10 @@ static void rtl8169_update_counters(struct rtl8169_private *tp)
 
 static void rtl8169_init_counter_offsets(struct rtl8169_private *tp)
 {
-	struct rtl8169_counters *counters = tp->counters;
-
-	/*
-	 * rtl8169_init_counter_offsets is called from rtl_open.  On chip
-	 * versions prior to RTL_GIGA_MAC_VER_19 the tally counters are only
-	 * reset by a power cycle, while the counter values collected by the
-	 * driver are reset at every driver unload/load cycle.
-	 *
-	 * To make sure the HW values returned by @get_stats64 match the SW
-	 * values, we collect the initial values at first open(*) and use them
-	 * as offsets to normalize the values returned by @get_stats64.
-	 *
-	 * (*) We can't call rtl8169_init_counter_offsets from rtl_init_one
-	 * for the reason stated in rtl8169_update_counters; CmdRxEnb is only
-	 * set at open time by rtl_hw_start.
-	 */
-
 	if (tp->tc_offset.inited)
 		return;
 
-	if (tp->mac_version >= RTL_GIGA_MAC_VER_19) {
-		rtl8169_do_counters(tp, CounterReset);
-	} else {
-		rtl8169_update_counters(tp);
-		tp->tc_offset.tx_errors = counters->tx_errors;
-		tp->tc_offset.tx_multi_collision = counters->tx_multi_collision;
-		tp->tc_offset.tx_aborted = counters->tx_aborted;
-		tp->tc_offset.rx_missed = counters->rx_missed;
-	}
+	rtl8169_do_counters(tp, CounterReset);
 
 	tp->tc_offset.inited = true;
 }
@@ -1728,8 +1570,7 @@ void r8169_apply_firmware(struct rtl8169_private *tp)
 static void rtl8168_config_eee_mac(struct rtl8169_private *tp)
 {
 	/* Adjust EEE LED frequency */
-	if (tp->mac_version != RTL_GIGA_MAC_VER_38)
-		RTL_W8(tp, EEE_LED, RTL_R8(tp, EEE_LED) & ~0x07);
+	RTL_W8(tp, EEE_LED, RTL_R8(tp, EEE_LED) & ~0x07);
 
 	rtl_eri_set_bits(tp, 0x1b0, 0x0003);
 }
@@ -1907,9 +1748,6 @@ static void rtl_wol_enable_rx(struct rtl8169_private *tp)
 
 static void rtl_prepare_power_down(struct rtl8169_private *tp)
 {
-	if (tp->dash_enabled)
-		return;
-
 	if (device_may_wakeup(tp_to_dev(tp))) {
 		phy_speed_down(tp->phydev, false);
 		rtl_wol_enable_rx(tp);
@@ -1944,7 +1782,7 @@ static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
 	RTL_W32(tp, RxDescAddrLow, ((u64) tp->RxPhyAddr) & DMA_BIT_MASK(32));
 }
 
- static void rtl_set_rx_mode(struct net_device *dev)
+static void rtl_set_rx_mode(struct net_device *dev)
 {
 	u32 rx_mode = AcceptBroadcast | AcceptMyPhys | AcceptMulticast;
 	/* Multicast hash filter */
@@ -1956,8 +1794,7 @@ static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
 		rx_mode |= AcceptAllPhys;
 	} else if (!(dev->flags & IFF_MULTICAST)) {
 		rx_mode &= ~AcceptMulticast;
-	} else if (dev->flags & IFF_ALLMULTI ||
-		   tp->mac_version == RTL_GIGA_MAC_VER_35) {
+	} else if (dev->flags & IFF_ALLMULTI) {
 		/* accept all multicasts */
 	} else if (netdev_mc_empty(dev)) {
 		rx_mode &= ~AcceptMulticast;
@@ -1970,11 +1807,9 @@ static void rtl_set_rx_tx_desc_registers(struct rtl8169_private *tp)
 			mc_filter[bit_nr >> 5] |= BIT(bit_nr & 31);
 		}
 
-		if (tp->mac_version > RTL_GIGA_MAC_VER_06) {
-			tmp = mc_filter[0];
-			mc_filter[0] = swab32(mc_filter[1]);
-			mc_filter[1] = swab32(tmp);
-		}
+		tmp = mc_filter[0];
+		mc_filter[0] = swab32(mc_filter[1]);
+		mc_filter[1] = swab32(tmp);
 	}
 
 	RTL_W32(tp, MAR0 + 4, mc_filter[1]);
@@ -2612,37 +2447,6 @@ err_stop_0:
 	return NETDEV_TX_BUSY;
 }
 
-static unsigned int rtl_last_frag_len(struct sk_buff *skb)
-{
-	struct skb_shared_info *info = skb_shinfo(skb);
-	unsigned int nr_frags = info->nr_frags;
-
-	if (!nr_frags)
-		return UINT_MAX;
-
-	return skb_frag_size(info->frags + nr_frags - 1);
-}
-
-/* Workaround for hw issues with TSO on RTL8168evl */
-static netdev_features_t rtl8168evl_fix_tso(struct sk_buff *skb,
-					    netdev_features_t features)
-{
-	/* IPv4 header has options field */
-	if (vlan_get_protocol(skb) == htons(ETH_P_IP) &&
-	    ip_hdrlen(skb) > sizeof(struct iphdr))
-		features &= ~NETIF_F_ALL_TSO;
-
-	/* IPv4 TCP header has options field */
-	else if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV4 &&
-		 tcp_hdrlen(skb) > sizeof(struct tcphdr))
-		features &= ~NETIF_F_ALL_TSO;
-
-	else if (rtl_last_frag_len(skb) <= 6)
-		features &= ~NETIF_F_ALL_TSO;
-
-	return features;
-}
-
 static netdev_features_t rtl8169_features_check(struct sk_buff *skb,
 						struct net_device *dev,
 						netdev_features_t features)
@@ -2650,9 +2454,6 @@ static netdev_features_t rtl8169_features_check(struct sk_buff *skb,
 	struct rtl8169_private *tp = netdev_priv(dev);
 
 	if (skb_is_gso(skb)) {
-		if (tp->mac_version == RTL_GIGA_MAC_VER_34)
-			features = rtl8168evl_fix_tso(skb, features);
-
 		if (skb_transport_offset(skb) > GTTCPHO_MAX &&
 		    rtl_chip_supports_csum_v2(tp))
 			features &= ~NETIF_F_ALL_TSO;
@@ -2853,12 +2654,6 @@ static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 
 	if (status & LinkChg)
 		phy_mac_interrupt(tp->phydev);
-
-	if (unlikely(status & RxFIFOOver &&
-	    tp->mac_version == RTL_GIGA_MAC_VER_11)) {
-		netif_stop_queue(tp->dev);
-		rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
-	}
 
 	if (napi_schedule_prep(&tp->napi)) {
 		rtl_irq_disable(tp);
@@ -3501,9 +3296,6 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		rc = pci_disable_link_state(pdev, PCIE_LINK_STATE_L1);
 	tp->aspm_manageable = !rc;
 
-	tp->dash_type = RTL_DASH_NONE;
-	tp->dash_enabled = false;
-
 	tp->cp_cmd = RTL_R16(tp, CPlusCmd) & CPCMD_MASK;
 
 	if (sizeof(dma_addr_t) > 4 &&
@@ -3558,12 +3350,7 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	/* configure chip for default features */
 	rtl8169_set_features(dev, dev->features);
 
-	if (!tp->dash_enabled) {
-		rtl_set_d3_pll_down(tp, true);
-	} else {
-		rtl_set_d3_pll_down(tp, false);
-		dev->wol_enabled = 1;
-	}
+	rtl_set_d3_pll_down(tp, true);
 
 	jumbo_max = rtl_jumbo_max(tp);
 	if (jumbo_max)
