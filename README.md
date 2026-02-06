@@ -17,6 +17,7 @@ SOEM EtherCAT 마스터의 send-recv 레이턴시를 31μs 이하로 줄이기 �
 | `r8169_irq_optimized/`    | 인터럽트 처리 최적화                                              |
 | `r8169_ethercat_opt/`     | EtherCAT 특화 최적화                                              |
 | `r8169_custom/`           | 기타 커스텀 실험                                                  |
+| `r8169_8168h_only/`       | RTL8168H 전용 경량화 드라이버                                     |
 
 루트의 `r8169_*.c` 파일들은 커널 원본 소스입니다.
 
