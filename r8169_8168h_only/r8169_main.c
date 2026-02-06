@@ -67,8 +67,9 @@
 static const struct {
 	const char *name;
 	const char *fw_name;
-} rtl_chip_infos[] = {
-	[RTL_GIGA_MAC_VER_46] = {"RTL8168h/8111h", FIRMWARE_8168H_2},
+} rtl_chip_info = {
+	.name = "RTL8168h/8111h",
+	.fw_name = FIRMWARE_8168H_2,
 };
 
 static const struct pci_device_id rtl8169_pci_tbl[] = {
@@ -502,7 +503,6 @@ struct rtl8169_private {
 	struct net_device *dev;
 	struct phy_device *phydev;
 	struct napi_struct napi;
-	enum mac_version mac_version;
 	u32 cur_rx; /* Index into the Rx descriptor buffer of next Rx pkt. */
 	u32 cur_tx; /* Index into the Tx descriptor buffer of next Rx pkt. */
 	u32 dirty_tx;
@@ -1533,12 +1533,9 @@ static void rtl_enable_eee(struct rtl8169_private *tp)
 		phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, adv);
 }
 
-static enum mac_version rtl8169_get_mac_version(u16 xid, bool gmii)
+static bool rtl8169_is_supported_xid(u16 xid, bool gmii)
 {
-	if ((xid & 0x7cf) == 0x541 && gmii)
-		return RTL_GIGA_MAC_VER_46;
-
-	return RTL_GIGA_MAC_NONE;
+	return (xid & 0x7cf) == 0x541 && gmii;
 }
 
 static void rtl_release_firmware(struct rtl8169_private *tp)
@@ -1602,7 +1599,7 @@ static void rtl_schedule_task(struct rtl8169_private *tp, enum rtl_flag flag)
 
 static void rtl8169_init_phy(struct rtl8169_private *tp)
 {
-	r8169_hw_phy_config(tp, tp->phydev, tp->mac_version);
+	r8169_hw_phy_config(tp, tp->phydev);
 
 	/* We may have called phy_speed_down before */
 	phy_speed_up(tp->phydev);
@@ -3215,7 +3212,6 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct rtl8169_private *tp;
 	int jumbo_max, region, rc;
-	enum mac_version chipset;
 	struct net_device *dev;
 	u32 txconfig;
 	u16 xid;
@@ -3276,16 +3272,10 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	xid = (txconfig >> 20) & 0xfcf;
 
 	/* Identify chip attached to board */
-	chipset = rtl8169_get_mac_version(xid, tp->supports_gmii);
-	if (chipset == RTL_GIGA_MAC_NONE)
+	if (!rtl8169_is_supported_xid(xid, tp->supports_gmii))
 		return dev_err_probe(&pdev->dev, -ENODEV,
 				     "unsupported XID %03x for rtl8168h-only driver\n",
 				     xid);
-	if (chipset != RTL_GIGA_MAC_VER_46)
-		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "chip version %d is not supported by rtl8168h-only driver\n",
-				     chipset);
-	tp->mac_version = chipset;
 
 	/* Disable ASPM L1 as that cause random device stop working
 	 * problems as well as full system hangs for some PCIe devices users.
@@ -3358,7 +3348,7 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	rtl_set_irq_mask(tp);
 
-	tp->fw_name = rtl_chip_infos[chipset].fw_name;
+	tp->fw_name = rtl_chip_info.fw_name;
 
 	tp->counters = dmam_alloc_coherent (&pdev->dev, sizeof(*tp->counters),
 					    &tp->counters_phys_addr,
@@ -3380,7 +3370,7 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		rtl8168_init_leds(dev);
 
 	netdev_info(dev, "%s, %pM, XID %03x, IRQ %d\n",
-		    rtl_chip_infos[chipset].name, dev->dev_addr, xid, tp->irq);
+		    rtl_chip_info.name, dev->dev_addr, xid, tp->irq);
 
 	if (jumbo_max)
 		netdev_info(dev, "jumbo features [frames: %d bytes, tx checksumming: %s]\n",

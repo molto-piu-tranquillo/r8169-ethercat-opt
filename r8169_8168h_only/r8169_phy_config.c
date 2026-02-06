@@ -77,11 +77,7 @@ static void rtl8168h_2_hw_phy_config(struct rtl8169_private *tp,
 	rtl8168h_config_eee_phy(phydev);
 }
 
-void r8169_hw_phy_config(struct rtl8169_private *tp, struct phy_device *phydev,
-			 enum mac_version ver)
+void r8169_hw_phy_config(struct rtl8169_private *tp, struct phy_device *phydev)
 {
-	if (ver != RTL_GIGA_MAC_VER_46)
-		return;
-
 	rtl8168h_2_hw_phy_config(tp, phydev);
 }
