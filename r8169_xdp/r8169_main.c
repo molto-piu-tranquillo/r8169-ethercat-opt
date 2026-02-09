@@ -85,6 +85,7 @@
 #define RTL_XDP_MAX_MTU                                                    \
 	(RTL_XDP_RX_BUF_SIZE - RTL_XDP_HEADROOM - ETH_HLEN - ETH_FCS_LEN - \
 	 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+#define RTL_XSK_TX_NAPI_BUDGET 64
 
 /* write/read MMIO register */
 #define RTL_W8(tp, reg, val8) writeb((val8), tp->mmio_addr + (reg))
@@ -560,9 +561,20 @@ struct RxDesc {
 	__le64 addr;
 };
 
+enum rtl_tx_buf_type {
+	RTL_TX_BUF_SKB = 0,
+	RTL_TX_BUF_XSK,
+	RTL_TX_BUF_XDP_ZC_TX,
+	RTL_TX_BUF_XDP_FRAME_RX,
+	RTL_TX_BUF_XDP_FRAME_NDO,
+};
+
 struct ring_info {
 	struct sk_buff *skb;
+	struct xdp_buff *xdp;
+	struct xdp_frame *xdpf;
 	u32 len;
+	enum rtl_tx_buf_type type;
 };
 
 struct rtl8169_counters {
@@ -3942,6 +3954,32 @@ static struct page *rtl8169_alloc_rx_data_xdp(struct rtl8169_private *tp,
 	return page;
 }
 
+static struct xdp_buff *rtl8169_alloc_rx_data_xsk(struct rtl8169_private *tp,
+						  struct RxDesc *desc,
+						  unsigned int entry)
+{
+	struct xsk_buff_pool *pool = tp->xsk_pool;
+	struct xdp_buff *xdp;
+	dma_addr_t dma;
+	u32 buf_size;
+
+	if (!pool)
+		return NULL;
+
+	xdp = xsk_buff_alloc(pool);
+	if (!xdp)
+		return NULL;
+
+	dma = xsk_buff_xdp_get_dma(xdp);
+	buf_size = xsk_pool_get_rx_frame_size(pool);
+	xsk_buff_raw_dma_sync_for_device(pool, dma, buf_size);
+	desc->addr = cpu_to_le64(dma);
+	rtl8169_xdp_mark_to_asic(desc, buf_size);
+	tp->rx_xdp_buff[entry] = xdp;
+
+	return xdp;
+}
+
 /* ========== End Page Pool and XDP Support ========== */
 
 static void rtl8169_mark_to_asic(struct RxDesc *desc)
@@ -3984,20 +4022,28 @@ static void rtl8169_rx_clear(struct rtl8169_private *tp)
 {
 	int i;
 
-	for (i = 0; i < NUM_RX_DESC && tp->Rx_databuff[i]; i++) {
-		if (tp->page_pool) {
-			/* page_pool mode: return page to pool */
-			page_pool_put_full_page(tp->page_pool,
-						tp->Rx_databuff[i], false);
-		} else {
-			/* Legacy mode: unmap and free */
-			dma_unmap_page(tp_to_dev(tp),
-				       le64_to_cpu(tp->RxDescArray[i].addr),
-				       R8169_RX_BUF_SIZE, DMA_FROM_DEVICE);
-			__free_pages(tp->Rx_databuff[i],
-				     get_order(R8169_RX_BUF_SIZE));
+	for (i = 0; i < NUM_RX_DESC; i++) {
+		if (tp->rx_xdp_buff[i]) {
+			xsk_buff_free(tp->rx_xdp_buff[i]);
+			tp->rx_xdp_buff[i] = NULL;
 		}
-		tp->Rx_databuff[i] = NULL;
+
+		if (tp->Rx_databuff[i]) {
+			if (tp->page_pool) {
+				/* page_pool mode: return page to pool */
+				page_pool_put_full_page(tp->page_pool,
+							tp->Rx_databuff[i], false);
+			} else {
+				/* Legacy mode: unmap and free */
+				dma_unmap_page(tp_to_dev(tp),
+					       le64_to_cpu(tp->RxDescArray[i].addr),
+					       R8169_RX_BUF_SIZE, DMA_FROM_DEVICE);
+				__free_pages(tp->Rx_databuff[i],
+					     get_order(R8169_RX_BUF_SIZE));
+			}
+			tp->Rx_databuff[i] = NULL;
+		}
+
 		tp->RxDescArray[i].addr = 0;
 		tp->RxDescArray[i].opts1 = 0;
 	}
@@ -4010,7 +4056,13 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
 	for (i = 0; i < NUM_RX_DESC; i++) {
 		struct page *data;
 
-		if (tp->page_pool) {
+		if (tp->xsk_pool) {
+			if (!rtl8169_alloc_rx_data_xsk(tp, tp->RxDescArray + i, i)) {
+				rtl8169_rx_clear(tp);
+				return -ENOMEM;
+			}
+			tp->Rx_databuff[i] = NULL;
+		} else if (tp->page_pool) {
 			/* XDP mode: use page_pool */
 			data = rtl8169_alloc_rx_data_xdp(tp,
 							 tp->RxDescArray + i);
@@ -4037,6 +4089,7 @@ static int rtl8169_init_ring(struct rtl8169_private *tp)
 
 	memset(tp->tx_skb, 0, sizeof(tp->tx_skb));
 	memset(tp->Rx_databuff, 0, sizeof(tp->Rx_databuff));
+	memset(tp->rx_xdp_buff, 0, sizeof(tp->rx_xdp_buff));
 
 	return rtl8169_rx_fill(tp);
 }
@@ -4046,8 +4099,11 @@ static void rtl8169_unmap_tx_skb(struct rtl8169_private *tp, unsigned int entry)
 	struct ring_info *tx_skb = tp->tx_skb + entry;
 	struct TxDesc *desc = tp->TxDescArray + entry;
 
-	dma_unmap_single(tp_to_dev(tp), le64_to_cpu(desc->addr), tx_skb->len,
-			 DMA_TO_DEVICE);
+	if (tx_skb->type == RTL_TX_BUF_SKB ||
+	    tx_skb->type == RTL_TX_BUF_XDP_FRAME_RX ||
+	    tx_skb->type == RTL_TX_BUF_XDP_FRAME_NDO)
+		dma_unmap_single(tp_to_dev(tp), le64_to_cpu(desc->addr),
+				 tx_skb->len, DMA_TO_DEVICE);
 	memset(desc, 0, sizeof(*desc));
 	memset(tx_skb, 0, sizeof(*tx_skb));
 }
@@ -4056,6 +4112,7 @@ static void rtl8169_tx_clear_range(struct rtl8169_private *tp, u32 start,
 				   unsigned int n)
 {
 	unsigned int i;
+	unsigned int xsk_compl = 0;
 
 	for (i = 0; i < n; i++) {
 		unsigned int entry = (start + i) % NUM_TX_DESC;
@@ -4064,12 +4121,25 @@ static void rtl8169_tx_clear_range(struct rtl8169_private *tp, u32 start,
 
 		if (len) {
 			struct sk_buff *skb = tx_skb->skb;
+			struct xdp_buff *xdp = tx_skb->xdp;
+			struct xdp_frame *xdpf = tx_skb->xdpf;
+			enum rtl_tx_buf_type type = tx_skb->type;
 
 			rtl8169_unmap_tx_skb(tp, entry);
 			if (skb)
 				dev_consume_skb_any(skb);
+			if (type == RTL_TX_BUF_XDP_ZC_TX && xdp)
+				xsk_buff_free(xdp);
+			else if ((type == RTL_TX_BUF_XDP_FRAME_RX ||
+				  type == RTL_TX_BUF_XDP_FRAME_NDO) && xdpf)
+				xdp_return_frame(xdpf);
+			else if (type == RTL_TX_BUF_XSK)
+				xsk_compl++;
 		}
 	}
+
+	if (xsk_compl && tp->xsk_pool)
+		xsk_tx_completed(tp->xsk_pool, xsk_compl);
 }
 
 static void rtl8169_tx_clear(struct rtl8169_private *tp)
@@ -4138,7 +4208,8 @@ static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
 }
 
 static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
-			  void *addr, unsigned int entry, bool desc_own)
+			  void *addr, unsigned int entry, bool desc_own,
+			  enum rtl_tx_buf_type type)
 {
 	struct TxDesc *txd = tp->TxDescArray + entry;
 	struct device *d = tp_to_dev(tp);
@@ -4165,6 +4236,9 @@ static int rtl8169_tx_map(struct rtl8169_private *tp, const u32 *opts, u32 len,
 	txd->opts1 = cpu_to_le32(opts1);
 
 	tp->tx_skb[entry].len = len;
+	tp->tx_skb[entry].type = type;
+	tp->tx_skb[entry].xdp = NULL;
+	tp->tx_skb[entry].xdpf = NULL;
 
 	return 0;
 }
@@ -4182,7 +4256,8 @@ static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
 
 		entry = (entry + 1) % NUM_TX_DESC;
 
-		if (unlikely(rtl8169_tx_map(tp, opts, len, addr, entry, true)))
+		if (unlikely(rtl8169_tx_map(tp, opts, len, addr, entry, true,
+					    RTL_TX_BUF_SKB)))
 			goto err_out;
 	}
 
@@ -4391,7 +4466,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
 		goto err_dma_0;
 
 	if (unlikely(rtl8169_tx_map(tp, opts, skb_headlen(skb), skb->data,
-				    entry, false)))
+				    entry, false, RTL_TX_BUF_SKB)))
 		goto err_dma_0;
 
 	txd_first = tp->TxDescArray + entry;
@@ -4520,10 +4595,336 @@ static void rtl8169_pcierr_interrupt(struct net_device *dev)
 	rtl_schedule_task(tp, RTL_FLAG_TASK_RESET_PENDING);
 }
 
+static int rtl8169_tx_submit_dma_locked(struct rtl8169_private *tp, dma_addr_t dma,
+					u32 len, enum rtl_tx_buf_type type,
+					struct xdp_buff *xdp,
+					struct xdp_frame *xdpf,
+					bool first_frag, bool last_frag);
+static void rtl8169_tx_submit_dma_nocheck_locked(struct rtl8169_private *tp,
+						 dma_addr_t dma, u32 len,
+						 enum rtl_tx_buf_type type,
+						 struct xdp_buff *xdp,
+						 struct xdp_frame *xdpf,
+						 bool first_frag,
+						 bool last_frag);
+
+static bool rtl8169_xsk_tx(struct rtl8169_private *tp, unsigned int budget)
+{
+	struct xsk_buff_pool *pool = tp->xsk_pool;
+	struct net_device *dev = tp->dev;
+	struct netdev_queue *nq;
+	unsigned int cpu, submitted = 0, processed = 0, handled_pkts = 0;
+	unsigned int dropped_descs = 0;
+	bool budget_exhausted = false;
+	bool need_wakeup;
+
+	if (!pool || !netif_carrier_ok(dev) || !budget)
+		return false;
+
+	need_wakeup = xsk_uses_need_wakeup(pool);
+	nq = netdev_get_tx_queue(dev, 0);
+	cpu = smp_processor_id();
+
+	__netif_tx_lock(nq, cpu);
+	txq_trans_cond_update(nq);
+
+	/* If TX ring is idle, request userspace wakeup before new submissions. */
+	if (need_wakeup && READ_ONCE(tp->cur_tx) == READ_ONCE(tp->dirty_tx))
+		xsk_set_tx_need_wakeup(pool);
+
+	while (rtl_tx_slots_avail(tp) && handled_pkts < budget) {
+		struct xdp_desc segs[MAX_SKB_FRAGS + 1];
+		struct xdp_desc xdp_desc;
+		unsigned int avail = rtl_tx_slots_avail(tp);
+		unsigned int nsegs = 0, pkt_descs = 0, i;
+		bool drop_packet = false;
+		dma_addr_t dma;
+
+		do {
+			if (!xsk_tx_peek_desc(pool, &xdp_desc))
+				goto out_submit;
+
+			processed++;
+			pkt_descs++;
+
+			if (unlikely(!xdp_desc.len))
+				drop_packet = true;
+
+			if (!drop_packet) {
+				if (nsegs >= avail || nsegs >= ARRAY_SIZE(segs))
+					drop_packet = true;
+				else
+					segs[nsegs++] = xdp_desc;
+			}
+		} while (!xsk_is_eop_desc(&xdp_desc));
+
+		if (drop_packet || !nsegs) {
+			dev->stats.tx_dropped++;
+			dropped_descs += pkt_descs;
+			handled_pkts++;
+			continue;
+		}
+
+		for (i = 0; i < nsegs; i++) {
+			dma = xsk_buff_raw_get_dma(pool, segs[i].addr);
+			xsk_buff_raw_dma_sync_for_device(pool, dma, segs[i].len);
+			if (rtl8169_tx_submit_dma_locked(tp, dma, segs[i].len,
+							 RTL_TX_BUF_XSK, NULL, NULL,
+							 i == 0, i == nsegs - 1)) {
+				dev->stats.tx_dropped++;
+				dropped_descs += pkt_descs - i;
+				goto out_submit;
+			}
+			submitted++;
+		}
+
+		handled_pkts++;
+	}
+
+	if (handled_pkts >= budget)
+		budget_exhausted = true;
+
+out_submit:
+	if (processed)
+		xsk_tx_release(pool);
+
+	if (dropped_descs)
+		xsk_tx_completed(pool, dropped_descs);
+
+	if (submitted)
+		rtl8169_doorbell(tp);
+
+	if (need_wakeup) {
+		if (READ_ONCE(tp->cur_tx) == READ_ONCE(tp->dirty_tx))
+			xsk_set_tx_need_wakeup(pool);
+		else
+			xsk_clear_tx_need_wakeup(pool);
+	}
+
+	__netif_tx_unlock(nq);
+
+	return budget_exhausted;
+}
+
+static int rtl8169_tx_submit_dma_locked(struct rtl8169_private *tp, dma_addr_t dma,
+					u32 len, enum rtl_tx_buf_type type,
+					struct xdp_buff *xdp,
+					struct xdp_frame *xdpf,
+					bool first_frag, bool last_frag)
+{
+	if (unlikely(!len))
+		return -EINVAL;
+
+	if (unlikely(!rtl_tx_slots_avail(tp)))
+		return -ENOSPC;
+
+	rtl8169_tx_submit_dma_nocheck_locked(tp, dma, len, type, xdp, xdpf,
+					     first_frag, last_frag);
+
+	return 0;
+}
+
+static void rtl8169_tx_submit_dma_nocheck_locked(struct rtl8169_private *tp,
+						 dma_addr_t dma, u32 len,
+						 enum rtl_tx_buf_type type,
+						 struct xdp_buff *xdp,
+						 struct xdp_frame *xdpf,
+						 bool first_frag,
+						 bool last_frag)
+{
+	unsigned int entry;
+	struct TxDesc *txd;
+	u32 opts1;
+
+	entry = tp->cur_tx % NUM_TX_DESC;
+	txd = tp->TxDescArray + entry;
+
+	txd->addr = cpu_to_le64(dma);
+	txd->opts2 = 0;
+
+	opts1 = len;
+	if (first_frag)
+		opts1 |= FirstFrag;
+	if (last_frag)
+		opts1 |= LastFrag;
+	if (entry == NUM_TX_DESC - 1)
+		opts1 |= RingEnd;
+
+	tp->tx_skb[entry].len = len;
+	tp->tx_skb[entry].type = type;
+	tp->tx_skb[entry].skb = NULL;
+	tp->tx_skb[entry].xdp = xdp;
+	tp->tx_skb[entry].xdpf = xdpf;
+
+	/* Publish descriptor contents before giving ownership to HW. */
+	dma_wmb();
+	WRITE_ONCE(txd->opts1, cpu_to_le32(opts1 | DescOwn));
+
+	/* rtl_tx() reads descriptors after seeing cur_tx updates. */
+	smp_wmb();
+	WRITE_ONCE(tp->cur_tx, tp->cur_tx + 1);
+}
+
+static bool rtl8169_xdp_tx_xsk(struct rtl8169_private *tp, struct xdp_buff *xdp,
+			       u32 len)
+{
+	struct net_device *dev = tp->dev;
+	struct netdev_queue *nq = netdev_get_tx_queue(dev, 0);
+	long dma_off;
+	dma_addr_t dma;
+	bool ret = false;
+
+	__netif_tx_lock(nq, smp_processor_id());
+	txq_trans_cond_update(nq);
+
+	if (!rtl_tx_slots_avail(tp))
+		goto out;
+
+	dma_off = xdp->data - xdp->data_hard_start - XDP_PACKET_HEADROOM;
+	dma = xsk_buff_xdp_get_dma(xdp) + dma_off;
+	xsk_buff_raw_dma_sync_for_device(tp->xsk_pool, dma, len);
+	if (!rtl8169_tx_submit_dma_locked(tp, dma, len, RTL_TX_BUF_XDP_ZC_TX, xdp,
+					  NULL, true, true)) {
+		rtl8169_doorbell(tp);
+		ret = true;
+	}
+out:
+	__netif_tx_unlock(nq);
+	return ret;
+}
+
+static int rtl8169_xdp_frame_tx_locked(struct rtl8169_private *tp,
+				       struct xdp_frame *xdpf,
+				       enum rtl_tx_buf_type type)
+{
+	struct skb_shared_info *sinfo = NULL;
+	struct {
+		dma_addr_t dma;
+		u32 len;
+	} segs[MAX_SKB_FRAGS + 1];
+	unsigned int nsegs = 0, i;
+	u8 nr_frags = 0;
+	int ret;
+
+	if (unlikely(type != RTL_TX_BUF_XDP_FRAME_RX &&
+		     type != RTL_TX_BUF_XDP_FRAME_NDO))
+		return -EINVAL;
+
+	if (unlikely(!xdpf->len))
+		return -EINVAL;
+
+	if (unlikely(xdp_frame_has_frags(xdpf))) {
+		sinfo = xdp_get_shared_info_from_frame(xdpf);
+		nr_frags = sinfo->nr_frags;
+	}
+
+	if (unlikely(rtl_tx_slots_avail(tp) < 1 + nr_frags))
+		return -ENOSPC;
+
+	segs[nsegs].len = xdpf->len;
+	segs[nsegs].dma = dma_map_single(tp_to_dev(tp), xdpf->data,
+					 segs[nsegs].len, DMA_TO_DEVICE);
+	if (unlikely(dma_mapping_error(tp_to_dev(tp), segs[nsegs].dma)))
+		return -EIO;
+	nsegs++;
+
+	for (i = 0; i < nr_frags; i++) {
+		skb_frag_t *frag = &sinfo->frags[i];
+		void *data = skb_frag_address(frag);
+
+		segs[nsegs].len = skb_frag_size(frag);
+		if (unlikely(!data || !segs[nsegs].len)) {
+			ret = -EINVAL;
+			goto unmap_err;
+		}
+
+		segs[nsegs].dma = dma_map_single(tp_to_dev(tp), data,
+						 segs[nsegs].len,
+						 DMA_TO_DEVICE);
+		if (unlikely(dma_mapping_error(tp_to_dev(tp), segs[nsegs].dma))) {
+			ret = -EIO;
+			goto unmap_err;
+		}
+		nsegs++;
+	}
+
+	for (i = 0; i < nsegs; i++)
+		rtl8169_tx_submit_dma_nocheck_locked(tp, segs[i].dma,
+						     segs[i].len, type, NULL,
+						     i == nsegs - 1 ? xdpf : NULL,
+						     i == 0, i == nsegs - 1);
+
+	return 0;
+
+unmap_err:
+	while (nsegs--)
+		dma_unmap_single(tp_to_dev(tp), segs[nsegs].dma, segs[nsegs].len,
+				 DMA_TO_DEVICE);
+	return ret;
+}
+
+static int rtl8169_xdp_xmit_back(struct rtl8169_private *tp, struct xdp_buff *xdp)
+{
+	struct netdev_queue *nq = netdev_get_tx_queue(tp->dev, 0);
+	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
+	int ret;
+
+	if (unlikely(!xdpf))
+		return -EFAULT;
+
+	__netif_tx_lock(nq, smp_processor_id());
+	txq_trans_cond_update(nq);
+
+	ret = rtl8169_xdp_frame_tx_locked(tp, xdpf, RTL_TX_BUF_XDP_FRAME_RX);
+	if (!ret)
+		rtl8169_doorbell(tp);
+
+	__netif_tx_unlock(nq);
+
+	if (ret)
+		xdp_return_frame_rx_napi(xdpf);
+
+	return ret;
+}
+
+static int rtl8169_xdp_xmit(struct net_device *dev, int n,
+			    struct xdp_frame **frames, u32 flags)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+	struct netdev_queue *nq = netdev_get_tx_queue(dev, 0);
+	int i, nxmit = 0;
+
+	if (unlikely(!netif_running(dev) || !netif_carrier_ok(dev)))
+		return -ENETDOWN;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	__netif_tx_lock(nq, smp_processor_id());
+	txq_trans_cond_update(nq);
+
+	for (i = 0; i < n; i++) {
+		if (rtl8169_xdp_frame_tx_locked(tp, frames[i],
+						RTL_TX_BUF_XDP_FRAME_NDO))
+			break;
+		nxmit++;
+	}
+
+	if ((flags & XDP_XMIT_FLUSH) && nxmit)
+		rtl8169_doorbell(tp);
+
+	__netif_tx_unlock(nq);
+
+	return nxmit;
+}
+
 static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		   int budget)
 {
 	unsigned int dirty_tx, bytes_compl = 0, pkts_compl = 0;
+	unsigned int xsk_bytes = 0, xsk_descs = 0, xsk_pkts = 0;
+	unsigned int xdp_zc_bytes = 0, xdp_zc_pkts = 0;
+	unsigned int xdp_frame_bytes = 0, xdp_frame_pkts = 0;
 	struct sk_buff *skb;
 
 	dirty_tx = tp->dirty_tx;
@@ -4536,8 +4937,44 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		if (status & DescOwn)
 			break;
 
+		if (tp->tx_skb[entry].type == RTL_TX_BUF_XSK) {
+			xsk_descs++;
+			xsk_bytes += tp->tx_skb[entry].len;
+			if (status & LastFrag)
+				xsk_pkts++;
+		} else if (tp->tx_skb[entry].type == RTL_TX_BUF_XDP_ZC_TX) {
+			xdp_zc_bytes += tp->tx_skb[entry].len;
+			if (status & LastFrag)
+				xdp_zc_pkts++;
+		} else if (tp->tx_skb[entry].type == RTL_TX_BUF_XDP_FRAME_RX ||
+			   tp->tx_skb[entry].type == RTL_TX_BUF_XDP_FRAME_NDO) {
+			xdp_frame_bytes += tp->tx_skb[entry].len;
+			if (status & LastFrag)
+				xdp_frame_pkts++;
+		}
+
 		skb = tp->tx_skb[entry].skb;
-		rtl8169_unmap_tx_skb(tp, entry);
+		if (tp->tx_skb[entry].type == RTL_TX_BUF_XDP_ZC_TX &&
+		    tp->tx_skb[entry].xdp) {
+			struct xdp_buff *xdp = tp->tx_skb[entry].xdp;
+
+			rtl8169_unmap_tx_skb(tp, entry);
+			xsk_buff_free(xdp);
+		} else if (tp->tx_skb[entry].type == RTL_TX_BUF_XDP_FRAME_RX &&
+			   tp->tx_skb[entry].xdpf) {
+			struct xdp_frame *xdpf = tp->tx_skb[entry].xdpf;
+
+			rtl8169_unmap_tx_skb(tp, entry);
+			xdp_return_frame_rx_napi(xdpf);
+		} else if (tp->tx_skb[entry].type == RTL_TX_BUF_XDP_FRAME_NDO &&
+			   tp->tx_skb[entry].xdpf) {
+			struct xdp_frame *xdpf = tp->tx_skb[entry].xdpf;
+
+			rtl8169_unmap_tx_skb(tp, entry);
+			xdp_return_frame(xdpf);
+		} else {
+			rtl8169_unmap_tx_skb(tp, entry);
+		}
 
 		if (skb) {
 			pkts_compl++;
@@ -4548,8 +4985,20 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 	}
 
 	if (tp->dirty_tx != dirty_tx) {
-		dev_sw_netstats_tx_add(dev, pkts_compl, bytes_compl);
+		dev_sw_netstats_tx_add(dev, pkts_compl + xsk_pkts + xdp_zc_pkts +
+						    xdp_frame_pkts,
+				       bytes_compl + xsk_bytes + xdp_zc_bytes +
+					       xdp_frame_bytes);
 		WRITE_ONCE(tp->dirty_tx, dirty_tx);
+
+		if (xsk_descs && tp->xsk_pool)
+			xsk_tx_completed(tp->xsk_pool, xsk_descs);
+		if (tp->xsk_pool && xsk_uses_need_wakeup(tp->xsk_pool)) {
+			if (READ_ONCE(tp->cur_tx) == dirty_tx)
+				xsk_set_tx_need_wakeup(tp->xsk_pool);
+			else
+				xsk_clear_tx_need_wakeup(tp->xsk_pool);
+		}
 
 		netif_subqueue_completed_wake(dev, 0, pkts_compl, bytes_compl,
 					      rtl_tx_slots_avail(tp),
@@ -4587,36 +5036,46 @@ static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 		     int budget)
 {
 	struct xsk_buff_pool *pool = tp->xsk_pool;
-	struct device *d = tp_to_dev(tp);
 	struct bpf_prog *xdp_prog;
+	u32 frame_sz = xsk_pool_get_rx_frame_size(pool);
 	int count = 0;
-	int refill_count = 0;
+	bool needs_xdp_flush = false;
+	bool rx_fill_fail = false;
 
 	xdp_prog = READ_ONCE(tp->xdp_prog);
 
 	for (count = 0; count < budget; count++, tp->cur_rx++) {
 		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
 		struct RxDesc *desc = tp->RxDescArray + entry;
-		struct page *page = tp->Rx_databuff[entry];
 		struct xdp_buff *xdp;
-		dma_addr_t addr;
+		struct sk_buff *skb = NULL;
+		u32 xdp_act = XDP_PASS;
 		u32 status;
-		u32 xdp_act;
-		void *data;
+		u32 data_len = 0;
+		bool consumed = false;
+
+		xdp = tp->rx_xdp_buff[entry];
+		if (unlikely(!xdp)) {
+			if (!rtl8169_alloc_rx_data_xsk(tp, desc, entry)) {
+				rx_fill_fail = true;
+				break;
+			}
+			count--;
+			continue;
+		}
 
 		status = le32_to_cpu(READ_ONCE(desc->opts1));
 		if (status & DescOwn)
 			break;
 
 		dma_rmb();
-
 		if (unlikely(status & RxRES)) {
 			dev->stats.rx_errors++;
 			if (status & (RxRWT | RxRUNT))
 				dev->stats.rx_length_errors++;
 			if (status & RxCRC)
 				dev->stats.rx_crc_errors++;
-			goto refill_desc;
+			goto rearm_desc;
 		}
 
 		pkt_size = status & GENMASK(13, 0);
@@ -4626,69 +5085,89 @@ static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 		if (unlikely(rtl8169_fragmented_frame(status))) {
 			dev->stats.rx_dropped++;
 			dev->stats.rx_length_errors++;
-			goto refill_desc;
+			goto rearm_desc;
 		}
 
-		addr = le64_to_cpu(desc->addr);
-		data = page_address(page) + RTL_XDP_HEADROOM;
-
-		dma_sync_single_for_cpu(d, addr, pkt_size, DMA_FROM_DEVICE);
-
-		/* Allocate XSK buffer from UMEM */
-		xdp = xsk_buff_alloc(pool);
-		if (!xdp) {
-			dev->stats.rx_dropped++;
-			goto refill_desc;
-		}
-
-		/* Copy data to UMEM buffer */
-		memcpy(xdp->data, data, pkt_size);
+		xsk_buff_dma_sync_for_cpu(xdp, pool);
 		xsk_buff_set_size(xdp, pkt_size);
+		data_len = xdp->data_end - xdp->data;
 
 		/* Run XDP program if attached */
-		if (xdp_prog) {
+		if (xdp_prog)
 			xdp_act = bpf_prog_run_xdp(xdp_prog, xdp);
 
-			switch (xdp_act) {
-			case XDP_PASS:
-				/* Submit to AF_XDP socket */
-				break;
-			case XDP_REDIRECT:
-				if (xdp_do_redirect(dev, xdp, xdp_prog) < 0) {
-					xsk_buff_free(xdp);
-					dev->stats.rx_dropped++;
-					goto refill_desc;
-				}
-				dev_sw_netstats_rx_add(dev, pkt_size);
-				goto refill_desc;
-			default:
-				bpf_warn_invalid_xdp_action(dev, xdp_prog,
-							    xdp_act);
-				fallthrough;
-			case XDP_ABORTED:
-			case XDP_DROP:
-			case XDP_TX:
-				xsk_buff_free(xdp);
+		switch (xdp_act) {
+		case XDP_PASS:
+			/* AF_XDP ZC path still needs an skb copy for stack delivery. */
+			skb = napi_alloc_skb(&tp->napi, data_len);
+			if (unlikely(!skb)) {
 				dev->stats.rx_dropped++;
-				goto refill_desc;
+				goto rearm_desc;
 			}
+			skb_copy_to_linear_data(skb, xdp->data, data_len);
+			skb->tail += data_len;
+			skb->len = data_len;
+
+			rtl8169_rx_csum(skb, status);
+			skb->protocol = eth_type_trans(skb, dev);
+			rtl8169_rx_vlan_tag(desc, skb);
+			if (skb->pkt_type == PACKET_MULTICAST)
+				dev->stats.multicast++;
+			napi_gro_receive(&tp->napi, skb);
+			dev_sw_netstats_rx_add(dev, data_len);
+			goto rearm_desc;
+
+		case XDP_REDIRECT:
+			if (xdp_do_redirect(dev, xdp, xdp_prog) < 0) {
+				dev->stats.rx_dropped++;
+				goto rearm_desc;
+			}
+			needs_xdp_flush = true;
+			consumed = true;
+			tp->rx_xdp_buff[entry] = NULL;
+			dev_sw_netstats_rx_add(dev, data_len);
+			break;
+
+		case XDP_TX:
+			if (!rtl8169_xdp_tx_xsk(tp, xdp, data_len)) {
+				dev->stats.rx_dropped++;
+				goto rearm_desc;
+			}
+			consumed = true;
+			tp->rx_xdp_buff[entry] = NULL;
+			break;
+
+		default:
+			bpf_warn_invalid_xdp_action(dev, xdp_prog, xdp_act);
+			fallthrough;
+		case XDP_ABORTED:
+		case XDP_DROP:
+			dev->stats.rx_dropped++;
+			goto rearm_desc;
 		}
 
-		/* Submit to AF_XDP RX ring */
-		xsk_buff_free(
-			xdp); /* For now, just free - actual zero-copy needs more integration */
-		dev_sw_netstats_rx_add(dev, pkt_size);
-
-refill_desc:
-		/* Reuse the page and mark descriptor */
-		rtl8169_xdp_mark_to_asic(desc, RTL_XDP_RX_BUF_SIZE -
-						       RTL_XDP_HEADROOM);
-		refill_count++;
+rearm_desc:
+		if (consumed) {
+			if (!rtl8169_alloc_rx_data_xsk(tp, desc, entry)) {
+				rx_fill_fail = true;
+				break;
+			}
+		} else {
+			xsk_buff_raw_dma_sync_for_device(pool, xsk_buff_xdp_get_dma(xdp),
+							 frame_sz);
+			rtl8169_xdp_mark_to_asic(desc, frame_sz);
+		}
 	}
 
-	/* Flush XSK socket if we processed any packets */
-	if (count > 0 && pool)
-		xsk_tx_completed(pool, 0); /* No TX completions in RX path */
+	if (needs_xdp_flush)
+		xdp_do_flush();
+
+	if (xsk_uses_need_wakeup(pool)) {
+		if (rx_fill_fail)
+			xsk_set_rx_need_wakeup(pool);
+		else
+			xsk_clear_rx_need_wakeup(pool);
+	}
 
 	return count;
 }
@@ -4700,6 +5179,7 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp,
 	struct device *d = tp_to_dev(tp);
 	struct bpf_prog *xdp_prog;
 	int count;
+	bool needs_xdp_flush = false;
 
 	xdp_prog = READ_ONCE(tp->xdp_prog);
 
@@ -4779,14 +5259,20 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp,
 				/* Continue to normal path */
 				break;
 			case XDP_TX:
-				/* XDP_TX not implemented yet - treat as drop */
-				dev->stats.rx_dropped++;
-				goto release_descriptor;
+				if (rtl8169_xdp_xmit_back(tp, &xdp) < 0) {
+					dev->stats.rx_dropped++;
+					goto release_descriptor;
+				}
+				/* Page ownership transferred to TX path */
+				page_reuse = false;
+				dev_sw_netstats_rx_add(dev, pkt_size);
+				goto next_desc;
 			case XDP_REDIRECT:
 				if (xdp_do_redirect(dev, &xdp, xdp_prog) < 0) {
 					dev->stats.rx_dropped++;
 					goto release_descriptor;
 				}
+				needs_xdp_flush = true;
 				/* Page ownership transferred to redirect target */
 				page_reuse = false;
 				dev_sw_netstats_rx_add(dev, pkt_size);
@@ -4862,6 +5348,9 @@ release_descriptor:
 				rtl8169_mark_to_asic(desc);
 		}
 	}
+
+	if (needs_xdp_flush)
+		xdp_do_flush();
 
 	return count;
 }
@@ -4948,6 +5437,7 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 	struct rtl8169_private *tp =
 		container_of(napi, struct rtl8169_private, napi);
 	struct net_device *dev = tp->dev;
+	bool xsk_budget_exhausted = false;
 	int work_done;
 
 	rtl_tx(dev, tp, budget);
@@ -4957,6 +5447,18 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 		work_done = rtl_rx_zc(dev, tp, budget);
 	else
 		work_done = rtl_rx(dev, tp, budget);
+
+	if (tp->xsk_pool) {
+		unsigned int xsk_budget = min_t(unsigned int, budget,
+						RTL_XSK_TX_NAPI_BUDGET);
+
+		if (!xsk_budget)
+			xsk_budget = 1;
+
+		xsk_budget_exhausted = rtl8169_xsk_tx(tp, xsk_budget);
+		if (xsk_budget_exhausted && work_done < budget)
+			work_done = budget;
+	}
 
 	if (work_done < budget && napi_complete_done(napi, work_done))
 		rtl_irq_enable(tp);
@@ -5115,8 +5617,17 @@ static int rtl_open(struct net_device *dev)
 	if (retval < 0)
 		goto err_destroy_pool;
 
-	retval = xdp_rxq_info_reg_mem_model(&tp->xdp_rxq, MEM_TYPE_PAGE_POOL,
-					    tp->page_pool);
+	if (tp->xsk_pool) {
+		retval = xdp_rxq_info_reg_mem_model(
+			&tp->xdp_rxq, MEM_TYPE_XSK_BUFF_POOL, NULL);
+		if (retval < 0)
+			goto err_unreg_rxq;
+		xsk_pool_set_rxq_info(tp->xsk_pool, &tp->xdp_rxq);
+	} else {
+		retval = xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+						    MEM_TYPE_PAGE_POOL,
+						    tp->page_pool);
+	}
 	if (retval < 0)
 		goto err_unreg_rxq;
 
@@ -5329,8 +5840,10 @@ static int rtl8169_xdp_setup(struct net_device *dev, struct bpf_prog *prog,
 			     struct netlink_ext_ack *extack)
 {
 	struct rtl8169_private *tp = netdev_priv(dev);
+	bool old_enabled = tp->xdp_enabled;
 	struct bpf_prog *old_prog;
 	bool need_reset = netif_running(dev);
+	int err = 0;
 
 	/* MTU check for XDP */
 	if (prog && dev->mtu > RTL_XDP_MAX_MTU) {
@@ -5348,13 +5861,35 @@ static int rtl8169_xdp_setup(struct net_device *dev, struct bpf_prog *prog,
 		rtl8169_close(dev);
 
 	old_prog = xchg(&tp->xdp_prog, prog);
+	tp->xdp_enabled = !!prog;
+
+	if (need_reset) {
+		err = rtl_open(dev);
+		if (err) {
+			struct bpf_prog *new_prog;
+			int reopen_err;
+
+			new_prog = xchg(&tp->xdp_prog, old_prog);
+			tp->xdp_enabled = old_enabled;
+			if (new_prog)
+				bpf_prog_put(new_prog);
+
+			reopen_err = rtl_open(dev);
+			if (reopen_err)
+				netdev_err(dev,
+					   "Failed to restore device after XDP setup failure: %d\n",
+					   reopen_err);
+			return err;
+		}
+	}
+
 	if (old_prog)
 		bpf_prog_put(old_prog);
 
-	tp->xdp_enabled = !!prog;
-
-	if (need_reset)
-		rtl_open(dev);
+	if (prog)
+		xdp_features_set_redirect_target(dev, false);
+	else
+		xdp_features_clear_redirect_target(dev);
 
 	return 0;
 }
@@ -5363,7 +5898,10 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 				  struct xsk_buff_pool *pool, u16 qid)
 {
 	struct rtl8169_private *tp = netdev_priv(dev);
+	struct xsk_buff_pool *old_pool = tp->xsk_pool;
 	bool need_reset = netif_running(dev);
+	bool mapped_new_pool = false;
+	int err = 0;
 
 	/* r8169 only has 1 queue */
 	if (qid >= 1) {
@@ -5371,39 +5909,66 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 		return -EINVAL;
 	}
 
-	if (need_reset)
-		rtl8169_close(dev);
-
 	if (pool) {
-		/* Enable AF_XDP */
-
 		/* Validate frame size */
 		if (xsk_pool_get_rx_frame_size(pool) <
 		    RTL_XDP_HEADROOM + dev->mtu + ETH_HLEN + ETH_FCS_LEN) {
 			netdev_err(dev,
 				   "UMEM frame size too small for MTU %d\n",
 				   dev->mtu);
-			if (need_reset)
-				rtl_open(dev);
 			return -EINVAL;
 		}
-
-		/* Link XSK pool to our RX queue */
-		xsk_pool_set_rxq_info(pool, &tp->xdp_rxq);
-
-		tp->xsk_pool = pool;
-
-		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0\n");
-	} else {
-		/* Disable AF_XDP */
-		tp->xsk_pool = NULL;
-		netdev_info(dev, "AF_XDP disabled on queue 0\n");
 	}
 
+	/* Nothing to do if the same pool is already configured. */
+	if (pool == old_pool && !need_reset)
+		return 0;
+
 	if (need_reset)
-		rtl_open(dev);
+		rtl8169_close(dev);
+
+	if (pool && pool != old_pool) {
+		err = xsk_pool_dma_map(pool, tp_to_dev(tp), 0);
+		if (err) {
+			netdev_err(dev, "Failed to map XSK pool: %d\n", err);
+			goto rollback;
+		}
+		mapped_new_pool = true;
+	}
+
+	tp->xsk_pool = pool;
+
+	if (need_reset) {
+		err = rtl_open(dev);
+		if (err)
+			goto rollback;
+	}
+
+	if (pool && xdp_rxq_info_is_reg(&tp->xdp_rxq))
+		xsk_pool_set_rxq_info(pool, &tp->xdp_rxq);
+
+	if (old_pool && old_pool != pool)
+		xsk_pool_dma_unmap(old_pool, 0);
+
+	if (pool)
+		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0\n");
+	else
+		netdev_info(dev, "AF_XDP disabled on queue 0\n");
 
 	return 0;
+
+rollback:
+	if (mapped_new_pool)
+		xsk_pool_dma_unmap(pool, 0);
+	tp->xsk_pool = old_pool;
+	if (need_reset) {
+		int reopen_err = rtl_open(dev);
+		if (reopen_err)
+			netdev_err(dev,
+				   "Failed to restore device after XSK setup failure: %d\n",
+				   reopen_err);
+	}
+	return err;
 }
 
 static int rtl8169_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
@@ -5411,6 +5976,9 @@ static int rtl8169_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
 	struct rtl8169_private *tp = netdev_priv(dev);
 
 	if (qid >= 1)
+		return -EINVAL;
+
+	if (flags & ~(XDP_WAKEUP_RX | XDP_WAKEUP_TX))
 		return -EINVAL;
 
 	if (!tp->xsk_pool)
@@ -5459,6 +6027,7 @@ static const struct net_device_ops rtl_netdev_ops = {
 	.ndo_poll_controller = rtl8169_netpoll,
 #endif
 	.ndo_bpf = rtl8169_xdp,
+	.ndo_xdp_xmit = rtl8169_xdp_xmit,
 	.ndo_xsk_wakeup = rtl8169_xsk_wakeup,
 };
 
@@ -5813,6 +6382,11 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	dev->ethtool_ops = &rtl8169_ethtool_ops;
 
 	netif_napi_add(dev, &tp->napi, rtl8169_poll);
+
+	dev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
+			    NETDEV_XDP_ACT_NDO_XMIT |
+			    NETDEV_XDP_ACT_XSK_ZEROCOPY |
+			    NETDEV_XDP_ACT_NDO_XMIT_SG;
 
 	dev->hw_features = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
 			   NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;

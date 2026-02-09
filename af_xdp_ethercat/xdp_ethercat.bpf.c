@@ -9,6 +9,7 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
 #define ETH_P_ETHERCAT 0x88A4
 
@@ -57,7 +58,7 @@ int xdp_ethercat_filter(struct xdp_md *ctx)
 		return XDP_PASS;
 
 	/* Check if EtherCAT frame (EtherType 0x88A4) */
-	if (eth->h_proto == __constant_htons(ETH_P_ETHERCAT)) {
+	if (eth->h_proto == bpf_htons(ETH_P_ETHERCAT)) {
 		update_stats(STATS_PKT_ETHERCAT);
 
 		/* Redirect to AF_XDP socket on queue 0 */
