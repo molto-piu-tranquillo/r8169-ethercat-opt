@@ -81,7 +81,7 @@
 
 /* XDP configuration */
 #define RTL_XDP_HEADROOM XDP_PACKET_HEADROOM /* 256 bytes */
-#define RTL_XDP_RX_BUF_SIZE 2048 /* Reduced for XDP single-buffer mode */
+#define RTL_XDP_RX_BUF_SIZE 4096 /* Full page for XDP, supports MTU 1500 */
 #define RTL_XDP_MAX_MTU                                                    \
 	(RTL_XDP_RX_BUF_SIZE - RTL_XDP_HEADROOM - ETH_HLEN - ETH_FCS_LEN - \
 	 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
@@ -4062,6 +4062,7 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp)
 				return -ENOMEM;
 			}
 			tp->Rx_databuff[i] = NULL;
+			continue;
 		} else if (tp->page_pool) {
 			/* XDP mode: use page_pool */
 			data = rtl8169_alloc_rx_data_xdp(tp,
@@ -4193,8 +4194,16 @@ static void rtl_reset_work(struct rtl8169_private *tp)
 
 	rtl8169_cleanup(tp);
 
-	for (i = 0; i < NUM_RX_DESC; i++)
-		rtl8169_mark_to_asic(tp->RxDescArray + i);
+	for (i = 0; i < NUM_RX_DESC; i++) {
+		if (tp->xsk_pool)
+			rtl8169_xdp_mark_to_asic(tp->RxDescArray + i,
+				xsk_pool_get_rx_frame_size(tp->xsk_pool));
+		else if (tp->page_pool)
+			rtl8169_xdp_mark_to_asic(tp->RxDescArray + i,
+				RTL_XDP_RX_BUF_SIZE - RTL_XDP_HEADROOM);
+		else
+			rtl8169_mark_to_asic(tp->RxDescArray + i);
+	}
 
 	napi_enable(&tp->napi);
 	rtl_hw_start(tp);
@@ -5032,6 +5041,8 @@ static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
 }
 
 /* AF_XDP Zero-Copy RX processing */
+static int rtl_rx_zc_dbg_cnt;
+
 static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 		     int budget)
 {
@@ -5043,6 +5054,23 @@ static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 	bool rx_fill_fail = false;
 
 	xdp_prog = READ_ONCE(tp->xdp_prog);
+
+	if (rtl_rx_zc_dbg_cnt < 3) {
+		unsigned int e = tp->cur_rx % NUM_RX_DESC;
+		u32 st = le32_to_cpu(READ_ONCE(tp->RxDescArray[e].opts1));
+		netdev_info(dev,
+			    "rtl_rx_zc[%d] cur_rx=%u desc[%u].opts1=0x%08x prog=%p budget=%d\n",
+			    rtl_rx_zc_dbg_cnt, tp->cur_rx, e, st, xdp_prog,
+			    budget);
+		rtl_rx_zc_dbg_cnt++;
+	}
+	if (unlikely(!xdp_prog))
+		/*
+		 * Some userspace setups install the default XSK redirect prog
+		 * in generic(SK B) mode even when socket bind requested DRV.
+		 * Keep ZC RX functional by running that prog as a fallback.
+		 */
+		xdp_prog = rcu_dereference_bh(dev->xdp_state[XDP_MODE_SKB].prog);
 
 	for (count = 0; count < budget; count++, tp->cur_rx++) {
 		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
@@ -5355,6 +5383,8 @@ release_descriptor:
 	return count;
 }
 
+static int rtl_irq_dbg_cnt;
+
 static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 {
 	struct rtl8169_private *tp = dev_instance;
@@ -5362,6 +5392,13 @@ static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 
 	if ((status & 0xffff) == 0xffff || !(status & tp->irq_mask))
 		return IRQ_NONE;
+
+	if (rtl_irq_dbg_cnt < 5 && tp->xsk_pool) {
+		netdev_info(tp->dev, "IRQ[%d] status=0x%04x (RxOK=%d TxOK=%d)\n",
+			    rtl_irq_dbg_cnt, status,
+			    !!(status & 0x0001), !!(status & 0x0004));
+		rtl_irq_dbg_cnt++;
+	}
 
 	if (unlikely(status & SYSErr)) {
 		rtl8169_pcierr_interrupt(tp->dev);
@@ -5840,10 +5877,7 @@ static int rtl8169_xdp_setup(struct net_device *dev, struct bpf_prog *prog,
 			     struct netlink_ext_ack *extack)
 {
 	struct rtl8169_private *tp = netdev_priv(dev);
-	bool old_enabled = tp->xdp_enabled;
 	struct bpf_prog *old_prog;
-	bool need_reset = netif_running(dev);
-	int err = 0;
 
 	/* MTU check for XDP */
 	if (prog && dev->mtu > RTL_XDP_MAX_MTU) {
@@ -5851,40 +5885,18 @@ static int rtl8169_xdp_setup(struct net_device *dev, struct bpf_prog *prog,
 		return -EINVAL;
 	}
 
-	/* Must have page_pool for XDP */
-	if (prog && !tp->page_pool) {
-		NL_SET_ERR_MSG_MOD(extack, "Page pool not available");
-		return -EINVAL;
-	}
-
-	if (need_reset)
-		rtl8169_close(dev);
-
+	/*
+	 * No close/open needed: page_pool is always created in rtl_open(),
+	 * so RX buffers are already XDP-compatible (single page, 4096 bytes).
+	 * Just swap the program pointer atomically.
+	 */
 	old_prog = xchg(&tp->xdp_prog, prog);
 	tp->xdp_enabled = !!prog;
 
-	if (need_reset) {
-		err = rtl_open(dev);
-		if (err) {
-			struct bpf_prog *new_prog;
-			int reopen_err;
-
-			new_prog = xchg(&tp->xdp_prog, old_prog);
-			tp->xdp_enabled = old_enabled;
-			if (new_prog)
-				bpf_prog_put(new_prog);
-
-			reopen_err = rtl_open(dev);
-			if (reopen_err)
-				netdev_err(dev,
-					   "Failed to restore device after XDP setup failure: %d\n",
-					   reopen_err);
-			return err;
-		}
-	}
-
-	if (old_prog)
+	if (old_prog) {
+		synchronize_net();
 		bpf_prog_put(old_prog);
+	}
 
 	if (prog)
 		xdp_features_set_redirect_target(dev, false);
@@ -5900,8 +5912,7 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 	struct rtl8169_private *tp = netdev_priv(dev);
 	struct xsk_buff_pool *old_pool = tp->xsk_pool;
 	bool need_reset = netif_running(dev);
-	bool mapped_new_pool = false;
-	int err = 0;
+	int i, err = 0;
 
 	/* r8169 only has 1 queue */
 	if (qid >= 1) {
@@ -5920,53 +5931,120 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 		}
 	}
 
-	/* Nothing to do if the same pool is already configured. */
 	if (pool == old_pool && !need_reset)
 		return 0;
 
-	if (need_reset)
-		rtl8169_close(dev);
+	/*
+	 * Minimal DMA-only reset: stop NIC DMA + NAPI, swap RX buffers,
+	 * restart.  Do NOT touch PHY (phy_stop/phy_start triggers link
+	 * renegotiation that takes 2-3s on 100Mbps EtherCAT).
+	 * Do NOT use rtl8169_down/rtl8169_up (PHY stop/start) or
+	 * rtl8169_close/rtl_open (full teardown, deadlock risk).
+	 */
+	if (need_reset) {
+		rtl8169_cleanup(tp);
+		rtl8169_rx_clear(tp);
+		xdp_rxq_info_unreg(&tp->xdp_rxq);
+	}
 
+	/* DMA-map the new pool */
 	if (pool && pool != old_pool) {
 		err = xsk_pool_dma_map(pool, tp_to_dev(tp), 0);
 		if (err) {
 			netdev_err(dev, "Failed to map XSK pool: %d\n", err);
 			goto rollback;
 		}
-		mapped_new_pool = true;
 	}
 
 	tp->xsk_pool = pool;
 
+	if (pool && !xsk_uses_need_wakeup(pool))
+		/* Keep TX wakeup armed so sendto() kicks can always drive NAPI. */
+		xsk_set_tx_need_wakeup(pool);
+
 	if (need_reset) {
-		err = rtl_open(dev);
+		/* Re-register xdp_rxq with correct memory model */
+		err = xdp_rxq_info_reg(&tp->xdp_rxq, dev, 0,
+				       tp->napi.napi_id);
 		if (err)
 			goto rollback;
-	}
 
-	if (pool && xdp_rxq_info_is_reg(&tp->xdp_rxq))
-		xsk_pool_set_rxq_info(pool, &tp->xdp_rxq);
+		if (pool) {
+			err = xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+				MEM_TYPE_XSK_BUFF_POOL, NULL);
+			if (err)
+				goto rollback;
+			xsk_pool_set_rxq_info(pool, &tp->xdp_rxq);
+		} else {
+			err = xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+				MEM_TYPE_PAGE_POOL, tp->page_pool);
+			if (err)
+				goto rollback;
+		}
+
+		/* Re-fill RX ring with correct buffer type */
+		err = rtl8169_rx_fill(tp);
+		if (err)
+			goto rollback;
+
+		/* Restart NIC DMA + NAPI without touching PHY */
+		for (i = 0; i < NUM_RX_DESC; i++) {
+			if (tp->xsk_pool)
+				rtl8169_xdp_mark_to_asic(tp->RxDescArray + i,
+					xsk_pool_get_rx_frame_size(
+						tp->xsk_pool));
+			else if (tp->page_pool)
+				rtl8169_xdp_mark_to_asic(tp->RxDescArray + i,
+					RTL_XDP_RX_BUF_SIZE -
+						RTL_XDP_HEADROOM);
+			else
+				rtl8169_mark_to_asic(tp->RxDescArray + i);
+		}
+		napi_enable(&tp->napi);
+		rtl_hw_start(tp);
+	}
 
 	if (old_pool && old_pool != pool)
 		xsk_pool_dma_unmap(old_pool, 0);
 
-	if (pool)
+	if (pool) {
 		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0\n");
-	else
+		/* Diagnostic: dump first 2 RX descriptors after setup */
+		netdev_info(dev, "XSK DIAG: cur_rx=%u RxPhyAddr=0x%llx pool=%p\n",
+			    tp->cur_rx, (u64)tp->RxPhyAddr, tp->xsk_pool);
+		netdev_info(dev, "XSK DIAG: desc[0] opts1=0x%08x addr=0x%016llx\n",
+			    le32_to_cpu(tp->RxDescArray[0].opts1),
+			    le64_to_cpu(tp->RxDescArray[0].addr));
+		netdev_info(dev, "XSK DIAG: desc[1] opts1=0x%08x addr=0x%016llx\n",
+			    le32_to_cpu(tp->RxDescArray[1].opts1),
+			    le64_to_cpu(tp->RxDescArray[1].addr));
+		netdev_info(dev, "XSK DIAG: xdp_prog=%p xdp_enabled=%d\n",
+			    tp->xdp_prog, tp->xdp_enabled);
+	} else
 		netdev_info(dev, "AF_XDP disabled on queue 0\n");
 
 	return 0;
 
 rollback:
-	if (mapped_new_pool)
+	if (pool && pool != old_pool)
 		xsk_pool_dma_unmap(pool, 0);
 	tp->xsk_pool = old_pool;
 	if (need_reset) {
-		int reopen_err = rtl_open(dev);
-		if (reopen_err)
-			netdev_err(dev,
-				   "Failed to restore device after XSK setup failure: %d\n",
-				   reopen_err);
+		/* Restore old memory model and restart */
+		if (!xdp_rxq_info_is_reg(&tp->xdp_rxq))
+			xdp_rxq_info_reg(&tp->xdp_rxq, dev, 0,
+					 tp->napi.napi_id);
+		if (old_pool) {
+			xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+				MEM_TYPE_XSK_BUFF_POOL, NULL);
+			xsk_pool_set_rxq_info(old_pool, &tp->xdp_rxq);
+		} else {
+			xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+				MEM_TYPE_PAGE_POOL, tp->page_pool);
+		}
+		rtl8169_rx_fill(tp);
+		napi_enable(&tp->napi);
+		rtl_hw_start(tp);
 	}
 	return err;
 }
