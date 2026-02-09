@@ -5041,8 +5041,6 @@ static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
 }
 
 /* AF_XDP Zero-Copy RX processing */
-static int rtl_rx_zc_dbg_cnt;
-
 static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 		     int budget)
 {
@@ -5054,16 +5052,6 @@ static int rtl_rx_zc(struct net_device *dev, struct rtl8169_private *tp,
 	bool rx_fill_fail = false;
 
 	xdp_prog = READ_ONCE(tp->xdp_prog);
-
-	if (rtl_rx_zc_dbg_cnt < 3) {
-		unsigned int e = tp->cur_rx % NUM_RX_DESC;
-		u32 st = le32_to_cpu(READ_ONCE(tp->RxDescArray[e].opts1));
-		netdev_info(dev,
-			    "rtl_rx_zc[%d] cur_rx=%u desc[%u].opts1=0x%08x prog=%p budget=%d\n",
-			    rtl_rx_zc_dbg_cnt, tp->cur_rx, e, st, xdp_prog,
-			    budget);
-		rtl_rx_zc_dbg_cnt++;
-	}
 	if (unlikely(!xdp_prog))
 		/*
 		 * Some userspace setups install the default XSK redirect prog
@@ -5383,8 +5371,6 @@ release_descriptor:
 	return count;
 }
 
-static int rtl_irq_dbg_cnt;
-
 static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 {
 	struct rtl8169_private *tp = dev_instance;
@@ -5392,13 +5378,6 @@ static irqreturn_t rtl8169_interrupt(int irq, void *dev_instance)
 
 	if ((status & 0xffff) == 0xffff || !(status & tp->irq_mask))
 		return IRQ_NONE;
-
-	if (rtl_irq_dbg_cnt < 5 && tp->xsk_pool) {
-		netdev_info(tp->dev, "IRQ[%d] status=0x%04x (RxOK=%d TxOK=%d)\n",
-			    rtl_irq_dbg_cnt, status,
-			    !!(status & 0x0001), !!(status & 0x0004));
-		rtl_irq_dbg_cnt++;
-	}
 
 	if (unlikely(status & SYSErr)) {
 		rtl8169_pcierr_interrupt(tp->dev);
@@ -6007,20 +5986,9 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 	if (old_pool && old_pool != pool)
 		xsk_pool_dma_unmap(old_pool, 0);
 
-	if (pool) {
+	if (pool)
 		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0\n");
-		/* Diagnostic: dump first 2 RX descriptors after setup */
-		netdev_info(dev, "XSK DIAG: cur_rx=%u RxPhyAddr=0x%llx pool=%p\n",
-			    tp->cur_rx, (u64)tp->RxPhyAddr, tp->xsk_pool);
-		netdev_info(dev, "XSK DIAG: desc[0] opts1=0x%08x addr=0x%016llx\n",
-			    le32_to_cpu(tp->RxDescArray[0].opts1),
-			    le64_to_cpu(tp->RxDescArray[0].addr));
-		netdev_info(dev, "XSK DIAG: desc[1] opts1=0x%08x addr=0x%016llx\n",
-			    le32_to_cpu(tp->RxDescArray[1].opts1),
-			    le64_to_cpu(tp->RxDescArray[1].addr));
-		netdev_info(dev, "XSK DIAG: xdp_prog=%p xdp_enabled=%d\n",
-			    tp->xdp_prog, tp->xdp_enabled);
-	} else
+	else
 		netdev_info(dev, "AF_XDP disabled on queue 0\n");
 
 	return 0;
