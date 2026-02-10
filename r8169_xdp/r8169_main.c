@@ -5478,7 +5478,7 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 
 	if (work_done < budget && napi_complete_done(napi, work_done)) {
 		/* In XSK busy-poll mode, keep IRQs disabled — userspace
-		 * re-schedules NAPI via sendto() + poll(). */
+		 * primes NAPI via sendto() before each poll(0). */
 		if (!tp->xsk_pool)
 			rtl_irq_enable(tp);
 	}
@@ -5986,10 +5986,9 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 		napi_enable(&tp->napi);
 		rtl_hw_start(tp);
 
-		/* In XSK busy-poll mode, userspace drives NAPI inline via
-		 * sendto() + poll().  Disable HW interrupts to eliminate
-		 * IRQ thread wakeup jitter.  rtl_hw_start() re-enables
-		 * them, so we must disable again here. */
+		/* In XSK busy-poll mode, disable HW IRQs — userspace
+		 * drives NAPI via sendto() + poll(0).  rtl_hw_start()
+		 * re-enables them, so we must disable again here. */
 		if (pool)
 			rtl_irq_disable(tp);
 	}
@@ -6044,7 +6043,14 @@ static int rtl8169_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
 	if (!netif_running(dev))
 		return -ENETDOWN;
 
-	/* Schedule NAPI to process XSK TX and refill RX */
+	/* napi_schedule() sets SCHED bit + raises softirq.
+	 * In busy-poll mode, napi_busy_loop() sees SCHED already
+	 * set and defers to local_bh_enable() which processes the
+	 * pending softirq inline — napi->poll() runs in SOEM's
+	 * process context, NOT via ksoftirqd.  The softirq raise
+	 * is architecturally required: napi_busy_loop uses SCHED
+	 * for ownership (skips when set), so set_bit alone breaks
+	 * the busy-poll mechanism. */
 	if (!napi_if_scheduled_mark_missed(&tp->napi))
 		napi_schedule(&tp->napi);
 
