@@ -5476,8 +5476,12 @@ static int rtl8169_poll(struct napi_struct *napi, int budget)
 			work_done = budget;
 	}
 
-	if (work_done < budget && napi_complete_done(napi, work_done))
-		rtl_irq_enable(tp);
+	if (work_done < budget && napi_complete_done(napi, work_done)) {
+		/* In XSK busy-poll mode, keep IRQs disabled — userspace
+		 * re-schedules NAPI via sendto() + poll(). */
+		if (!tp->xsk_pool)
+			rtl_irq_enable(tp);
+	}
 
 	return work_done;
 }
@@ -5981,13 +5985,20 @@ static int rtl8169_xsk_pool_setup(struct net_device *dev,
 		}
 		napi_enable(&tp->napi);
 		rtl_hw_start(tp);
+
+		/* In XSK busy-poll mode, userspace drives NAPI inline via
+		 * sendto() + poll().  Disable HW interrupts to eliminate
+		 * IRQ thread wakeup jitter.  rtl_hw_start() re-enables
+		 * them, so we must disable again here. */
+		if (pool)
+			rtl_irq_disable(tp);
 	}
 
 	if (old_pool && old_pool != pool)
 		xsk_pool_dma_unmap(old_pool, 0);
 
 	if (pool)
-		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0\n");
+		netdev_info(dev, "AF_XDP zero-copy enabled on queue 0 (IRQ disabled)\n");
 	else
 		netdev_info(dev, "AF_XDP disabled on queue 0\n");
 
