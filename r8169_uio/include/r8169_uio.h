@@ -32,6 +32,10 @@
 #define REG_Config1             0x52
 #define REG_Config2             0x53
 #define REG_Config5             0x56
+#define REG_PHYAR               0x60  /* PHY Access Register (MDIO) */
+#define REG_PMCH                0x6f  /* PLL power control */
+#define REG_MISC                0xf0
+#define RXDV_GATED_EN           (1 << 19)
 #define REG_RxMaxSize           0xda
 #define REG_CPlusCmd            0xe0
 #define REG_IntrMitigate        0xe2
@@ -51,13 +55,23 @@
 #define Cfg9346_Lock   0x00
 #define Cfg9346_Unlock 0xC0
 
-/* RxConfig bits */
+/* TxConfig bits (8168H) */
+#define TX_DMA_BURST     (7 << 8)   /* max PCI burst */
+#define TX_IFG           (3 << 24)  /* shortest InterFrameGap */
+#define TXCFG_AUTO_FIFO  (1 << 7)   /* 8168evl auto FIFO */
+
+/* RxConfig bits (8168H) */
 #define AcceptBroadcast  0x08
 #define AcceptMulticast  0x04
 #define AcceptMyPhys     0x02
 #define AcceptAllPhys    0x01
-#define RX_FIFO_THRESH   (7 << 13)
+#define RX128_INT_EN     (1 << 15)
+#define RX_MULTI_EN      (1 << 14)
+#define RX_EARLY_OFF     (1 << 11)
 #define RX_DMA_BURST     (7 << 8)
+
+/* MaxTxPacketSize for 8168evl (units of 128 bytes) */
+#define EarlySize        0x27
 
 /* IntrMask / IntrStatus bits */
 #define RxOK        0x0001

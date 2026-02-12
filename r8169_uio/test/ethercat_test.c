@@ -111,6 +111,42 @@ int main(int argc, char **argv)
 	uint32_t total = 0, timeouts = 0;
 	uint64_t min_ns = UINT64_MAX, max_ns = 0, sum_ns = 0;
 
+	/* Diagnostic: send one frame and check if NIC processes the TX descriptor */
+	{
+		printf("TX diag: sending first frame (%zu bytes)...\n", sizeof(tx_frame));
+		int txr = r8169_tx(&dev, &tx_frame, sizeof(tx_frame));
+		printf("  r8169_tx returned %d\n", txr);
+
+		/* Wait up to 10ms for TX to complete */
+		for (int i = 0; i < 100; i++) {
+			usleep(100);
+			r8169_tx_complete(&dev);
+			if (dev.dirty_tx == dev.cur_tx)
+				break;
+		}
+		printf("  TX complete: cur_tx=%u dirty_tx=%u (%s)\n",
+		       dev.cur_tx, dev.dirty_tx,
+		       (dev.dirty_tx == dev.cur_tx) ? "OK" : "STUCK - NIC not processing TX");
+
+		/* Check IntrStatus for TX/RX events */
+		uint16_t isr = rtl_r16(dev.mmio, REG_IntrStatus);
+		printf("  IntrStatus=0x%04x (TxOK=%d RxOK=%d TxErr=%d RxErr=%d)\n",
+		       isr, !!(isr & TxOK), !!(isr & RxOK),
+		       !!(isr & TxErr), !!(isr & RxErr));
+		/* ACK all */
+		rtl_w16(dev.mmio, REG_IntrStatus, 0xFFFF);
+
+		/* Try to receive the response */
+		usleep(5000);
+		int rx_len = r8169_rx(&dev, rx_buf, sizeof(rx_buf));
+		printf("  RX after 5ms: %d bytes\n", rx_len);
+		if (rx_len > 0) {
+			printf("  RX ethertype: 0x%04x\n",
+			       ntohs(*(uint16_t *)(rx_buf + 12)));
+		}
+		printf("\n");
+	}
+
 	printf("Sending EtherCAT BRD frames... (Ctrl+C to stop)\n\n");
 
 	/* Main loop: send frame, busy-poll for response, measure latency */

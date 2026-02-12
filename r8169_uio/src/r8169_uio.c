@@ -96,6 +96,33 @@ static int find_mmio_bar(const char *pci_bdf, int *bar_idx, size_t *bar_size)
 	return -1;
 }
 
+/* ---------- MDIO (PHY register access) ---------- */
+
+static void phy_write(volatile void *mmio, int reg, uint16_t val)
+{
+	rtl_w32(mmio, REG_PHYAR,
+		0x80000000 | ((reg & 0x1f) << 16) | (val & 0xffff));
+	/* Wait for write to complete (bit 31 clears) */
+	for (int i = 0; i < 2000; i++) {
+		usleep(1);
+		if (!(rtl_r32(mmio, REG_PHYAR) & 0x80000000))
+			return;
+	}
+}
+
+static uint16_t phy_read(volatile void *mmio, int reg)
+{
+	rtl_w32(mmio, REG_PHYAR, (reg & 0x1f) << 16);
+	/* Wait for read to complete (bit 31 sets) */
+	for (int i = 0; i < 2000; i++) {
+		usleep(1);
+		uint32_t v = rtl_r32(mmio, REG_PHYAR);
+		if (v & 0x80000000)
+			return (uint16_t)(v & 0xffff);
+	}
+	return 0xffff;
+}
+
 /* ---------- NIC initialization ---------- */
 
 static void nic_reset(struct r8169_uio *dev)
@@ -110,6 +137,31 @@ static void nic_reset(struct r8169_uio *dev)
 		usleep(100);
 	}
 	fprintf(stderr, "WARNING: chip reset timeout\n");
+}
+
+static void nic_phy_power_up(struct r8169_uio *dev)
+{
+	volatile void *mmio = dev->mmio;
+
+	/* Power up PHY PLL (PMCH register, bits 7:6) */
+	rtl_w8(mmio, REG_PMCH, rtl_r8(mmio, REG_PMCH) | 0xC0);
+
+	/* Select PHY page 0 and enable auto-negotiation */
+	phy_write(mmio, 0x1f, 0x0000);  /* page 0 */
+	phy_write(mmio, 0x00, 0x1000);  /* BMCR: auto-neg enable */
+
+	/* Wait for link (up to 5 seconds) */
+	printf("Waiting for PHY link...");
+	fflush(stdout);
+	for (int i = 0; i < 50; i++) {
+		usleep(100000);  /* 100ms */
+		uint16_t bmsr = phy_read(mmio, 0x01);  /* BMSR */
+		if (bmsr & 0x0004) {  /* link status bit */
+			printf(" link up\n");
+			return;
+		}
+	}
+	printf(" timeout (no link)\n");
 }
 
 static void nic_init_rings(struct r8169_uio *dev)
@@ -144,7 +196,7 @@ static void nic_hw_start(struct r8169_uio *dev)
 {
 	volatile void *mmio = dev->mmio;
 
-	/* Unlock config registers */
+	/* === Phase 1: config-locked registers === */
 	rtl_w8(mmio, REG_Cfg9346, Cfg9346_Unlock);
 
 	/* Disable all interrupts */
@@ -154,34 +206,42 @@ static void nic_hw_start(struct r8169_uio *dev)
 	/* Disable interrupt coalescing */
 	rtl_w16(mmio, REG_IntrMitigate, 0);
 
-	/* Set descriptor ring addresses */
-	rtl_w32(mmio, REG_TxDescStartAddrLow,
-		(uint32_t)(dev->tx_ring_phys & 0xFFFFFFFF));
-	rtl_w32(mmio, REG_TxDescStartAddrHigh,
-		(uint32_t)(dev->tx_ring_phys >> 32));
-	rtl_w32(mmio, REG_RxDescAddrLow,
-		(uint32_t)(dev->rx_ring_phys & 0xFFFFFFFF));
-	rtl_w32(mmio, REG_RxDescAddrHigh,
-		(uint32_t)(dev->rx_ring_phys >> 32));
+	/* Max TX packet size for 8168evl (EarlySize) */
+	rtl_w8(mmio, REG_MaxTxPacketSize, EarlySize);
+
+	/* Disable RXDV gate (8168H blocks RX after reset until cleared) */
+	rtl_w32(mmio, REG_MISC,
+		rtl_r32(mmio, REG_MISC) & ~RXDV_GATED_EN);
 
 	/* Set max RX packet size */
 	rtl_w16(mmio, REG_RxMaxSize, BUF_SIZE);
 
-	/* Set max TX packet size (8168 format: in units of 128 bytes) */
-	rtl_w8(mmio, REG_MaxTxPacketSize, 0x3f);  /* ~8KB max */
+	/* Set descriptor ring addresses (write High BEFORE Low) */
+	rtl_w32(mmio, REG_TxDescStartAddrHigh,
+		(uint32_t)(dev->tx_ring_phys >> 32));
+	rtl_w32(mmio, REG_TxDescStartAddrLow,
+		(uint32_t)(dev->tx_ring_phys & 0xFFFFFFFF));
+	rtl_w32(mmio, REG_RxDescAddrHigh,
+		(uint32_t)(dev->rx_ring_phys >> 32));
+	rtl_w32(mmio, REG_RxDescAddrLow,
+		(uint32_t)(dev->rx_ring_phys & 0xFFFFFFFF));
 
-	/* Configure RX: accept broadcast + our MAC, max DMA burst */
-	uint32_t rx_cfg = rtl_r32(mmio, REG_RxConfig);
-	rx_cfg &= ~0x3F;  /* clear accept bits */
-	rx_cfg |= AcceptBroadcast | AcceptMyPhys;
-	rx_cfg |= RX_FIFO_THRESH | RX_DMA_BURST;
-	rtl_w32(mmio, REG_RxConfig, rx_cfg);
+	rtl_w8(mmio, REG_Cfg9346, Cfg9346_Lock);
 
-	/* Enable TX and RX */
+	/* PCI commit — ensure all config writes reach HW */
+	rtl_r8(mmio, REG_Cfg9346);
+
+	/* === Phase 2: enable TX/RX, then set DMA config === */
 	rtl_w8(mmio, REG_ChipCmd, CmdTxEnb | CmdRxEnb);
 
-	/* Lock config registers */
-	rtl_w8(mmio, REG_Cfg9346, Cfg9346_Lock);
+	/* RxConfig: 8168H base (no RX_FIFO_THRESH — that's for 8169) */
+	rtl_w32(mmio, REG_RxConfig,
+		RX128_INT_EN | RX_MULTI_EN | RX_DMA_BURST | RX_EARLY_OFF |
+		AcceptBroadcast | AcceptMyPhys);
+
+	/* TxConfig: DMA burst + IFG + auto FIFO (8168evl) */
+	rtl_w32(mmio, REG_TxConfig,
+		TX_DMA_BURST | TX_IFG | TXCFG_AUTO_FIFO);
 }
 
 static void nic_read_mac(struct r8169_uio *dev)
@@ -192,6 +252,46 @@ static void nic_read_mac(struct r8169_uio *dev)
 	printf("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
 	       dev->mac[0], dev->mac[1], dev->mac[2],
 	       dev->mac[3], dev->mac[4], dev->mac[5]);
+}
+
+/* Enable PCI bus mastering (required for DMA).
+ * Kernel driver does pci_set_master(); uio_pci_generic does not. */
+static int pci_enable_bus_master(const char *pci_bdf)
+{
+	char path[256];
+	int fd;
+	uint16_t cmd;
+
+	snprintf(path, sizeof(path),
+		 "/sys/bus/pci/devices/%s/config", pci_bdf);
+	fd = open(path, O_RDWR);
+	if (fd < 0) {
+		perror("open PCI config");
+		return -1;
+	}
+
+	/* PCI Command Register at offset 0x04 */
+	if (pread(fd, &cmd, 2, 0x04) != 2) {
+		perror("read PCI command");
+		close(fd);
+		return -1;
+	}
+
+	printf("PCI Command: 0x%04x (BusMaster=%d)\n",
+	       cmd, !!(cmd & 0x04));
+
+	if (!(cmd & 0x04)) {
+		cmd |= 0x04;  /* Set Bus Master Enable (bit 2) */
+		if (pwrite(fd, &cmd, 2, 0x04) != 2) {
+			perror("write PCI command");
+			close(fd);
+			return -1;
+		}
+		printf("PCI Bus Master enabled\n");
+	}
+
+	close(fd);
+	return 0;
 }
 
 /* ---------- Public API ---------- */
@@ -269,8 +369,17 @@ int r8169_uio_init(struct r8169_uio *dev, const char *pci_bdf)
 	dev->tx_buf_phys  = base_phys + TX_BUF_OFFSET;
 	dev->rx_buf_phys  = base_phys + RX_BUF_OFFSET;
 
-	/* 6. Reset and initialize NIC */
+	/* 6. Enable PCI bus mastering for DMA */
+	if (pci_enable_bus_master(pci_bdf) < 0) {
+		dma_free(&dev->dma);
+		munmap((void *)dev->mmio, bar_size);
+		close(dev->uio_fd);
+		return -1;
+	}
+
+	/* 7. Reset and initialize NIC */
 	nic_reset(dev);
+	nic_phy_power_up(dev);
 	nic_read_mac(dev);
 	nic_init_rings(dev);
 	nic_hw_start(dev);
