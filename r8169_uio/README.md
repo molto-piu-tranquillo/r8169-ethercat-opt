@@ -27,12 +27,24 @@ make -j4
 # 1. Bind NIC to UIO (unbinds from kernel driver)
 sudo ./scripts/bind_uio.sh bind
 
-# 2. Run standalone EtherCAT test
+# 2. Apply runtime optimizations (ksoftirqd priority + L2 cache partitioning)
+#    These reset on reboot — re-run after every boot or driver reload.
+sudo chrt -f -p 99 $(pgrep -x "ksoftirqd/3")
+sudo mount -t resctrl resctrl /sys/fs/resctrl 2>/dev/null || true
+sudo mkdir -p /sys/fs/resctrl/rt_cpu3
+echo 3      | sudo tee /sys/fs/resctrl/rt_cpu3/cpus_list > /dev/null
+echo "L2:0=03ff" | sudo tee /sys/fs/resctrl/schemata > /dev/null
+echo "L2:0=fc00" | sudo tee /sys/fs/resctrl/rt_cpu3/schemata > /dev/null
+
+# 3. Run standalone EtherCAT test
 sudo ./build/ethercat_test
 
-# 3. Restore kernel driver
+# 4. Restore kernel driver when done
 sudo ./scripts/bind_uio.sh unbind
 ```
+
+> **Note:** UIO bind 후 `eth0` 인터페이스가 사라지며 `/proc/interrupts`에
+> eth0 IRQ가 표시되지 않습니다. 정상 동작이며, unbind 시 복구됩니다.
 
 ## SOEM Integration
 
@@ -44,6 +56,9 @@ git clone -b feat/uio https://github.com/molto-piu-tranquillo/soem-perf-measure.
 cd soem-perf-measure && mkdir build && cd build && cmake .. && make
 sudo ./test/linux/simple_test/cycle_test_2 eth0
 ```
+
+> `cycle_test_2`는 내부적으로 CPU3 pinning (`pthread_setaffinity_np`)과
+> SCHED_FIFO 99 (`sched_setscheduler`)를 설정하므로 외부 `chrt`/`taskset` 불필요.
 
 ## Files
 
